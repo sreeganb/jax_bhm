@@ -7,7 +7,7 @@ Individual particles are defined by their 3D coordinates (x, y, z).
 """
 
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from dataclasses import dataclass, field
 
 

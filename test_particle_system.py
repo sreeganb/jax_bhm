@@ -82,7 +82,7 @@ def test_particle_system():
     assert len(particles_b) == 3
     
     # Test validate_copy_numbers
-    assert system.validate_copy_numbers() == True
+    assert system.validate_copy_numbers()
     
     # Test get_coordinates_array
     coords_array = system.get_coordinates_array()
@@ -115,7 +115,7 @@ def test_ideal_ground_truth_system():
     assert len(system.particles) == 32  # 8 + 8 + 16
     
     # Validate copy numbers match
-    assert system.validate_copy_numbers() == True
+    assert system.validate_copy_numbers()
     
     # Check particles by type
     particles_a = system.get_particles_by_type('A')

@@ -60,9 +60,10 @@ def main():
     
     # 4. Run MCMC sampling
     print("\n4. Running MCMC sampling...")
-    print("   Algorithm: NUTS (No-U-Turn Sampler)")
+    print("   Algorithm: NUTS (No-U-Turn Sampler) with adaptive tuning")
     print("   Warmup samples: 500")
     print("   Production samples: 1000")
+    print("   Temperature: 300 (helps exploration)")
     print("   This may take a minute...")
     
     samples, sampling_info = sample_structure(
@@ -70,8 +71,8 @@ def main():
         energy_fn=energy_fn,
         n_samples=1000,
         n_warmup=500,
-        step_size=0.01,
-        temperature=1.0,
+        step_size=0.1,  # Larger step size for better exploration
+        temperature=300.0,  # Higher temperature helps exploration
         algorithm="nuts",
         key=key
     )

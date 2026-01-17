@@ -92,11 +92,15 @@ def sample_structure(
     def logprob_fn(pos):
         return log_probability_fn(pos, energy_fn, temperature)
     
+    # Create identity inverse mass matrix
+    n_dims = initial_position.shape[0]
+    inverse_mass_matrix = jnp.ones(n_dims)
+    
     # Initialize sampling algorithm
     if algorithm.lower() == "nuts":
-        sampler = blackjax.nuts(logprob_fn, step_size=step_size)
+        sampler = blackjax.nuts(logprob_fn, step_size=step_size, inverse_mass_matrix=inverse_mass_matrix)
     elif algorithm.lower() == "hmc":
-        sampler = blackjax.hmc(logprob_fn, step_size=step_size, num_integration_steps=10)
+        sampler = blackjax.hmc(logprob_fn, step_size=step_size, inverse_mass_matrix=inverse_mass_matrix, num_integration_steps=10)
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}. Use 'nuts' or 'hmc'.")
     

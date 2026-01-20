@@ -6,6 +6,7 @@ ideal coordinates, and basic operations for MCMC sampling and scoring.
 """
 
 import jax.numpy as jnp
+import jax
 import numpy as np
 from typing import Dict, Tuple, List
 from dataclasses import dataclass
@@ -18,34 +19,52 @@ class ParticleSystem:
 
     Attributes:
         types: Dict of particle types with radii and copy numbers.
-        coords: JAX array of current coordinates (N, 3).
+        coords: Dict of coordinates per type or JAX array (N, 3).
         ideal_coords: Dict of ideal coordinates per type.
     """
     types: Dict[str, Dict[str, float]]  # e.g., {'A': {'radius': 1.0, 'copy': 8}}
-    coords: jnp.ndarray
+    coords: Dict[str, jnp.ndarray]  # Changed to Dict to match usage
     ideal_coords: Dict[str, jnp.ndarray]
 
     @classmethod
-    def create(cls, types: Dict[str, Dict[str, float]], coords: jnp.ndarray) -> 'ParticleSystem':
+    def create(cls, types: Dict[str, Dict[str, float]], coords: Dict[str, jnp.ndarray]) -> 'ParticleSystem':
         ideal_coords = get_ideal_coords()
         return cls(types, coords, ideal_coords)
     
     @property
     def identity_order(self) -> List[str]:
         return sorted(self.types.keys())
+    
+    @property
+    def total_particles(self) -> int:
+        """Total number of particles in the system."""
+        return sum(int(self.types[k]['copy']) for k in self.types)
 
     def get_coords_by_type(self, identity: str) -> jnp.ndarray:
         """Get coordinates for a specific type."""
-        # This assumes coords are sorted by type!
-        start = sum(int(self.types[t]['copy']) for t in sorted(self.types) if t < identity)
-        end = start + int(self.types[identity]['copy'])
-        return self.coords[start:end]
+        return self.coords[identity]
+        
+    def flatten(self, coords: Dict[str, jnp.ndarray]) -> jnp.ndarray:
+        """Convert dictionary of coordinates to flat 1D array."""
+        flat_list = []
+        for k in self.identity_order:
+            # Flatten each particle type's coords from (n_particles, 3) to (n_particles*3,)
+            flat_list.append(coords[k].reshape(-1))
+        return jnp.concatenate(flat_list, axis=0)
         
     def unflatten(self, flat_coords: jnp.ndarray) -> Dict[str, jnp.ndarray]:
-        """Convert flat array back to dictionary of coordinates."""
-        return {k: self.get_coords_by_type_from_flat(flat_coords, k) for k in self.identity_order}
+        """Convert flat 1D array back to dictionary of coordinates."""
+        coords_dict = {}
+        idx = 0
+        for k in self.identity_order:
+            n = int(self.types[k]['copy'])
+            n_coords = n * 3  # 3 coordinates per particle
+            coords_dict[k] = flat_coords[idx:idx+n_coords].reshape(n, 3)
+            idx += n_coords
+        return coords_dict
         
     def get_coords_by_type_from_flat(self, flat: jnp.ndarray, identity: str) -> jnp.ndarray:
+        """Extract coordinates for a specific type from flat array."""
         start = sum(int(self.types[t]['copy']) for t in sorted(self.types) if t < identity)
         end = start + int(self.types[identity]['copy'])
         return flat[start:end]
@@ -59,10 +78,9 @@ class ParticleSystem:
             radii_list.append(jnp.full((n,), r))
         return jnp.concatenate(radii_list, axis=0)
 
-    def update_coords(self, new_coords: jnp.ndarray):
+    def update_coords(self, new_coords: Dict[str, jnp.ndarray]):
         """Update coordinates."""
         self.coords = new_coords
-
 
     def compute_score(self) -> float:
         """Placeholder for scoring function (e.g., distance-based)."""
@@ -73,7 +91,20 @@ class ParticleSystem:
             ideal = self.ideal_coords[identity]
             score += jnp.sum((current - ideal)**2)
         return float(score)
-
+    
+    def get_random_coords(self, rng_key: jnp.ndarray, box_size: Tuple[float, float, float]) -> Dict[str, jnp.ndarray]:
+        """Generate random coordinates with uniform prior inside a simulation box.
+        
+        Args:
+            rng_key: JAX PRNGKey
+            box_size: (x, y, z) dimensions of box in Angstrom
+        """
+        coords = {}
+        for k in self.identity_order:
+            rng_key, subkey = jax.random.split(rng_key)
+            n = int(self.types[k]['copy'])
+            coords[k] = jax.random.uniform(subkey, (n, 3), minval=0.0, maxval=1.0) * jnp.array(box_size)
+        return coords
 
 def get_ideal_coords() -> Dict[str, jnp.ndarray]:
     """Return ideal coordinates for particle types."""
@@ -122,7 +153,6 @@ def get_ideal_coords() -> Dict[str, jnp.ndarray]:
         'C': jnp.array(array_C)
     }
 
-
 # Example usage
 if __name__ == "__main__":
     types = {
@@ -132,7 +162,7 @@ if __name__ == "__main__":
     }
     # Initialize with ideal coords
     ideal = get_ideal_coords()
-    initial_coords = jnp.concatenate([ideal['A'], ideal['B'], ideal['C']])
-    system = ParticleSystem.create(types, initial_coords)
-    print(f"Total particles: {len(system.coords)}")
+    coords = {'A': ideal['A'], 'B': ideal['B'], 'C': ideal['C']}
+    system = ParticleSystem.create(types, coords)
+    print(f"Total particles: {system.total_particles}")
     print(f"Score: {system.compute_score()}")

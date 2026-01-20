@@ -5,6 +5,7 @@ import h5py
 import numpy as np
 import jax.numpy as jnp
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any
 
 def save_mcmc_to_hdf5(
@@ -13,12 +14,28 @@ def save_mcmc_to_hdf5(
     acceptance_rate: float,
     filename: str,
     system_template, # ParticleSystem
-    params: Dict[str, Any] = None
+    params: Dict[str, Any] = None,
+    convert_to_rmf3: bool = False,
+    color_map: Dict[str, tuple] = None
 ):
     """
-    Save MCMC trajectory to HDF5.
+    Save MCMC trajectory to HDF5, optionally convert to RMF3.
+    
+    Args:
+        positions: Array of particle positions (n_samples, n_particles*3)
+        log_probs: Log probability for each sample
+        acceptance_rate: Overall acceptance rate
+        filename: Output HDF5 filename
+        system_template: ParticleSystem instance
+        params: Additional parameters to save
+        convert_to_rmf3: If True, also create RMF3 file (requires IMP)
+        color_map: Optional color mapping for RMF3 visualization
     """
     n_samples = positions.shape[0]
+    
+    # Ensure output directory exists
+    output_path = Path(filename).parent
+    output_path.mkdir(parents=True, exist_ok=True)
     
     with h5py.File(filename, 'w') as f:
         # Metadata
@@ -35,10 +52,6 @@ def save_mcmc_to_hdf5(
         # Coordinates Group
         coords_grp = f.create_group('coordinates')
         
-        # We need to unflatten each frame. 
-        # Doing this loop in python might be slow for huge trajectories, 
-        # but fine for toy models.
-        
         # Pre-allocate arrays
         coord_buffers = {}
         for k in system_template.identity_order:
@@ -47,13 +60,13 @@ def save_mcmc_to_hdf5(
             
         # Process frames
         for i in range(n_samples):
-            # Using system_template.unflatten logic, but on numpy array
-            flat = positions[i]
+            flat = positions[i]  # Shape: (n_particles * 3,)
             idx = 0
             for k in system_template.identity_order:
                 n = int(system_template.types[k]['copy'])
-                coord_buffers[k][i] = flat[idx : idx + n]
-                idx += n
+                n_coords = n * 3  # Total coordinates for this type
+                coord_buffers[k][i] = flat[idx : idx + n_coords].reshape(n, 3)
+                idx += n_coords
                 
         # Write to HDF5
         for k, data in coord_buffers.items():
@@ -85,3 +98,13 @@ def save_mcmc_to_hdf5(
                         pass # Skip non-serializable
 
     print(f"Saved trajectory to {filename}")
+    
+    # Convert to RMF3 if requested
+    if convert_to_rmf3:
+        try:
+            from .rmf3_converter import convert_hdf5_to_rmf3
+            rmf3_filename = str(Path(filename).with_suffix('.rmf3'))
+            convert_hdf5_to_rmf3(filename, rmf3_filename, color_map=color_map)
+        except ImportError as e:
+            print(f"Warning: Could not convert to RMF3: {e}")
+            print("Install IMP to enable RMF3 conversion: conda install -c salilab imp")

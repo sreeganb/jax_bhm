@@ -7,18 +7,21 @@ This script demonstrates:
 3. Running RMH MCMC sampling
 4. Saving the trajectory to HDF5 (and optionally RMF3)
 """
-import jax.numpy as jnp
-import jax
 import numpy as np
 import sys
 import os
 from pathlib import Path
 
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+
+import jax.numpy as jnp
+import jax
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from representation.particle_system import ParticleSystem, get_ideal_coords
 from scoring.energy import log_probability
-from sampling.mcmc import run_rmh_sampling, run_parallel_rmh, run_annealed_rmh
+from sampling.rmh import run_rmh_sampling, run_parallel_rmh, run_annealed_rmh
 from io_utils.io_handlers import save_mcmc_to_hdf5
 
 

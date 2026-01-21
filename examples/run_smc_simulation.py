@@ -1,12 +1,16 @@
 """
 Example script to run SMC simulation using BlackJAX.
 """
-import jax.numpy as jnp
-import jax
 import numpy as np
 import sys
 import os
 from pathlib import Path
+
+# comment the next line to use GPU/TPU if available
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+
+import jax.numpy as jnp
+import jax
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -31,18 +35,21 @@ def main():
     
     ideal_coords = get_ideal_coords()
     
+    coords = ParticleSystem(types_config, {}, ideal_coords).get_random_coords(
+    jax.random.PRNGKey(42), box_size=[500.0, 500.0, 500.0]
+)   
     # 2. Create system template
-    system = ParticleSystem(types_config, {}, ideal_coords)
+    system = ParticleSystem(types_config, {}, coords)
     flat_radii = system.get_flat_radii()
     n_dims = system.total_particles * 3
     print(f"System: {system.total_particles} particles, {n_dims} dimensions")
     
     # 3. Restraints
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
-    nuisance_params = {'AA': 5.0, 'AB': 5.0, 'BC': 5.0}
+    nuisance_params = {'AA': 1.6, 'AB': 1.4, 'BC': 1.0}
     
     # 4. Define prior and likelihood separately (required by SMC)
-    box_size = 300.0
+    box_size = 500.0
     
     def log_prior_fn(flat_coords):
         """Uniform prior in box."""
@@ -55,7 +62,7 @@ def main():
         return log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=0.1, pair_weight=0.1, exvol_sigma=0.1
+            exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=0.1
         )
     
     def log_prob_fn(flat_coords):
@@ -81,9 +88,9 @@ def main():
         log_prob_fn=log_prob_fn,
         initial_positions=initial_positions,
         rng_key=smc_key,
-        n_mcmc_steps=50,
-        rmh_sigma=0.5,
-        target_ess=0.7,
+        n_mcmc_steps=500,
+        rmh_sigma=2.0,
+        target_ess=0.5,
         record_best=True,
     )
     

@@ -8,7 +8,7 @@ from pathlib import Path
 import mrcfile
 
 # comment the next line to use GPU/TPU if available
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+#os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
@@ -68,7 +68,7 @@ def main():
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
     
-    # 1. Define particle system
+    # 1. Define particle system configuration
     types_config = {
         'A': {'radius': 24.0, 'copy': 8},
         'B': {'radius': 14.0, 'copy': 8},
@@ -77,110 +77,119 @@ def main():
     
     ideal_coords = get_ideal_coords()
     
-    coords = ParticleSystem(types_config, {}, ideal_coords).get_random_coords(
-    jax.random.PRNGKey(42), box_size=[500.0, 500.0, 500.0]
-)   
-    # 2. Create system template
-    system = ParticleSystem(types_config, {}, coords)
+    # 2. Load target density for EM scoring
+    mrc_path = output_dir / "simulated_target_density.mrc"
+    resolution = 50.0  # Å
+    
+    print(f"\nLoading target density: {mrc_path}")
+    with mrcfile.open(str(mrc_path), mode='r') as mrc:
+        em_config = create_em_config_from_mrcfile(mrc, resolution)
+        density_data = mrc.data.copy()
+        density_voxel_size = float(mrc.voxel_size.x)
+        print(f"  Shape: {mrc.data.shape}, Voxel: {density_voxel_size:.2f} Å")
+    
+    # Compute density center of mass
+    density_com = compute_density_center_of_mass(density_data, density_voxel_size)
+    print(f"  Density COM: [{density_com[0]:.2f}, {density_com[1]:.2f}, {density_com[2]:.2f}] Å")
+    
+    # 3. Generate random coordinates
+    temp_system = ParticleSystem(types_config, {}, ideal_coords)
+    coords = temp_system.get_random_coords(
+        jax.random.PRNGKey(42), box_size=[500.0, 500.0, 500.0]
+    )
+    
+    # 4. Shift coordinates COM to match density COM BEFORE creating system
+    identity_order = sorted(types_config.keys())
+    coords_array = jnp.concatenate([coords[k] for k in identity_order], axis=0)
+    coords_com = jnp.mean(coords_array, axis=0)
+    shift_vector = density_com - np.array(coords_com)
+    
+    print(f"  Coords COM before shift: [{coords_com[0]:.2f}, {coords_com[1]:.2f}, {coords_com[2]:.2f}] Å")
+    print(f"  Shifting by: [{shift_vector[0]:.2f}, {shift_vector[1]:.2f}, {shift_vector[2]:.2f}] Å")
+    
+    # Apply shift to coordinates dictionary
+    shifted_coords = {}
+    for k in coords:
+        shifted_coords[k] = coords[k] + jnp.array(shift_vector)
+    
+    # Verify shift
+    shifted_array = jnp.concatenate([shifted_coords[k] for k in identity_order], axis=0)
+    shifted_com = jnp.mean(shifted_array, axis=0)
+    print(f"  Coords COM after shift: [{shifted_com[0]:.2f}, {shifted_com[1]:.2f}, {shifted_com[2]:.2f}] Å")
+    
+    # 5. NOW create the system with shifted coordinates
+    system = ParticleSystem(types_config, shifted_coords, ideal_coords)
     flat_radii = system.get_flat_radii()
     n_dims = system.total_particles * 3
-    print(f"System: {system.total_particles} particles, {n_dims} dimensions")
+    print(f"\nSystem: {system.total_particles} particles, {n_dims} dimensions")
     
-    # 3. Restraints
+    # 6. Setup EM scoring
+    em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=1.0)
+    radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
+    
+    # 7. Restraints
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
     nuisance_params = {'AA': 1.6, 'AB': 1.4, 'BC': 1.0}
     
-    # 4. Define prior and likelihood separately (required by SMC)
+    # 8. Define prior and likelihood separately (required by SMC)
     box_size = 500.0
     
-    #============================================================================#
-    # 2. Load target density for EM scoring
-    #============================================================================#
-#    output_dir = Path("output")
-#    output_dir.mkdir(exist_ok=True)
-#    mrc_path = output_dir / "simulated_target_density.mrc"
-#    resolution = 50.0  # Å
-#    
-#    print(f"\nLoading target density: {mrc_path}")
-#    with mrcfile.open(str(mrc_path), mode='r') as mrc:
-#        em_config = create_em_config_from_mrcfile(mrc, resolution)
-#        density_data = mrc.data.copy()
-#        density_voxel_size = float(mrc.voxel_size.x)
-#        print(f"  Shape: {mrc.data.shape}, Voxel: {density_voxel_size:.2f} Å")
-#    
-#    # Compute density center of mass
-#    density_com = compute_density_center_of_mass(density_data, density_voxel_size)
-#    print(f"  Density COM: [{density_com[0]:.2f}, {density_com[1]:.2f}, {density_com[2]:.2f}] Å")
-#    em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=1.0)
-#    radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
-#
-#============================================================================#    
     def log_prior_fn(flat_coords):
         """Uniform prior in box."""
         coords = flat_coords.reshape(-1, 3)
-        in_box = jnp.all((coords >= 0) & (coords <= box_size))
+        in_box = jnp.all((coords >= -box_size) & (coords <= box_size))
         return jnp.where(in_box, 0.0, -jnp.inf)
     
+    @jax.jit
     def log_likelihood_fn(flat_coords):
-        """Likelihood from scoring function."""
-        return log_probability(
+        """Combined likelihood: EM score + exclusion volume + pairwise restraints."""
+        # EM score (CCC-based)
+        ccc = em_log_prob(flat_coords)  # CCC in [-1, 1]
+        em_score = -(1.0 - ccc)  # 0 = perfect, -2 = anticorrelated
+        
+        # Exclusion volume + pairwise restraints
+        log_lik = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=0.1
-        )    
+            exclusion_weight=1.0,
+            pair_weight=1.0,
+            exvol_sigma=0.1
+        )
+        
+        return em_score + log_lik
     
     def log_prob_fn(flat_coords):
         """Combined log probability."""
         return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
 
-#    @jax.jit
-#    def log_likelihood_fn(flat_coords):
-#        """Combined likelihood: EM score + exclusion volume + pairwise restraints."""
-#        # EM score (CCC-based)
-#        ccc = em_log_prob(flat_coords)  # CCC in [-1, 1]
-#        em_score = -(1.0 - ccc)  # 0 = perfect, -2 = anticorrelated
-#        
-#        # Exclusion volume + pairwise restraints
-#        log_lik = log_probability(
-#            flat_coords, system, flat_radii,
-#            target_dists, nuisance_params,
-#            exclusion_weight=1.0,
-#            pair_weight=1.0,
-#            exvol_sigma=0.1
-#        )
-        
-#        return em_score + log_lik
-    
-#    def log_prob_fn(flat_coords):
-#        """Combined log probability."""
-#        return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
-
-    # 5. Initialize particles (n_particles, n_dims)
-    n_particles = 100
+    # 9. Initialize particles (n_particles, n_dims) - start from shifted coords with noise
+    n_particles = 50
     rng_key = jax.random.PRNGKey(42)
     rng_key, init_key = jax.random.split(rng_key)
-    initial_positions = jax.random.uniform(init_key, (n_particles, n_dims)) * box_size
+    
+    # Start from shifted coordinates with small Gaussian noise
+    flat_shifted = system.flatten(shifted_coords)
+    initial_positions = flat_shifted + jax.random.normal(init_key, (n_particles, n_dims)) * 10.0
     
     # Check initial scores
     init_scores = jax.vmap(log_prob_fn)(initial_positions)
-    print(f"Initial Score (mean): {jnp.mean(init_scores):.2f}")
+    print(f"\nInitial Score (mean): {jnp.mean(init_scores):.2f}")
     
-    # 6. Run SMC
+    # 10. Run SMC
     rng_key, smc_key = jax.random.split(rng_key)
-    # Use smaller RMH sigma and more MCMC steps to encourage movement
     final_state, info_history, best_positions, best_scores = run_tempered_smc(
         log_prior_fn=log_prior_fn,
         log_likelihood_fn=log_likelihood_fn,
         log_prob_fn=log_prob_fn,
         initial_positions=initial_positions,
         rng_key=smc_key,
-        n_mcmc_steps=500,
-        rmh_sigma=2.0,
+        n_mcmc_steps=20,
+        rmh_sigma=5.0,
         target_ess=0.7,
         record_best=True,
     )
     
-    # 7. Get results
+    # 11. Get results
     final_positions = get_smc_samples(final_state)
     best_pos, best_score = get_best_sample(final_state, log_prob_fn)
     
@@ -188,8 +197,7 @@ def main():
     print(f"\nFinal Score (mean): {jnp.mean(final_scores):.2f}")
     print(f"Best Score: {best_score:.2f}")
     
-    # 8. Save
-    # Save the best sample at each tempering step to visualize a true trajectory.
+    # 12. Save
     if best_positions is not None and best_scores is not None:
         # Report motion between steps
         diffs = np.linalg.norm(np.diff(np.array(best_positions), axis=0), axis=1)

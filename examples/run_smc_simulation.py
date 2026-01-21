@@ -5,6 +5,7 @@ import numpy as np
 import sys
 import os
 from pathlib import Path
+import mrcfile
 
 # comment the next line to use GPU/TPU if available
 os.environ["JAX_PLATFORM_NAME"] = "cpu"
@@ -18,7 +19,48 @@ from representation.particle_system import ParticleSystem, get_ideal_coords
 from scoring.energy import log_probability
 from sampling.smc import run_tempered_smc, get_smc_samples, get_best_sample
 from io_utils.io_handlers import save_mcmc_to_hdf5
+from scoring.em_score import (
+    create_em_config_from_mrcfile,
+    create_em_config_from_arrays,
+    calc_projection_jax,
+    calculate_ccc_score,
+    create_em_log_prob_fn,
+)
 
+def compute_density_center_of_mass(density: np.ndarray, voxel_size: float) -> np.ndarray:
+    """
+    Compute center of mass of density map.
+    
+    Returns coordinates in Angstroms, centered at origin if map is centered.
+    """
+    # Get grid dimensions
+    nz, ny, nx = density.shape
+    
+    # Create coordinate grids (centered at origin)
+    half_x = nx * voxel_size / 2
+    half_y = ny * voxel_size / 2
+    half_z = nz * voxel_size / 2
+    
+    x = np.linspace(-half_x + voxel_size/2, half_x - voxel_size/2, nx)
+    y = np.linspace(-half_y + voxel_size/2, half_y - voxel_size/2, ny)
+    z = np.linspace(-half_z + voxel_size/2, half_z - voxel_size/2, nz)
+    
+    # Create meshgrid
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    
+    # Normalize density (use only positive values)
+    density_pos = np.maximum(density, 0)
+    total_mass = np.sum(density_pos)
+    
+    if total_mass < 1e-10:
+        return np.array([0.0, 0.0, 0.0])
+    
+    # Compute center of mass
+    com_x = np.sum(X * density_pos) / total_mass
+    com_y = np.sum(Y * density_pos) / total_mass
+    com_z = np.sum(Z * density_pos) / total_mass
+    
+    return np.array([com_x, com_y, com_z])
 
 def main():
     print("Setting up system...")
@@ -51,6 +93,28 @@ def main():
     # 4. Define prior and likelihood separately (required by SMC)
     box_size = 500.0
     
+    #============================================================================#
+    # 2. Load target density for EM scoring
+    #============================================================================#
+#    output_dir = Path("output")
+#    output_dir.mkdir(exist_ok=True)
+#    mrc_path = output_dir / "simulated_target_density.mrc"
+#    resolution = 50.0  # Å
+#    
+#    print(f"\nLoading target density: {mrc_path}")
+#    with mrcfile.open(str(mrc_path), mode='r') as mrc:
+#        em_config = create_em_config_from_mrcfile(mrc, resolution)
+#        density_data = mrc.data.copy()
+#        density_voxel_size = float(mrc.voxel_size.x)
+#        print(f"  Shape: {mrc.data.shape}, Voxel: {density_voxel_size:.2f} Å")
+#    
+#    # Compute density center of mass
+#    density_com = compute_density_center_of_mass(density_data, density_voxel_size)
+#    print(f"  Density COM: [{density_com[0]:.2f}, {density_com[1]:.2f}, {density_com[2]:.2f}] Å")
+#    em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=1.0)
+#    radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
+#
+#============================================================================#    
     def log_prior_fn(flat_coords):
         """Uniform prior in box."""
         coords = flat_coords.reshape(-1, 3)
@@ -63,12 +127,34 @@ def main():
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
             exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=0.1
-        )
+        )    
     
     def log_prob_fn(flat_coords):
         """Combined log probability."""
         return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
+
+#    @jax.jit
+#    def log_likelihood_fn(flat_coords):
+#        """Combined likelihood: EM score + exclusion volume + pairwise restraints."""
+#        # EM score (CCC-based)
+#        ccc = em_log_prob(flat_coords)  # CCC in [-1, 1]
+#        em_score = -(1.0 - ccc)  # 0 = perfect, -2 = anticorrelated
+#        
+#        # Exclusion volume + pairwise restraints
+#        log_lik = log_probability(
+#            flat_coords, system, flat_radii,
+#            target_dists, nuisance_params,
+#            exclusion_weight=1.0,
+#            pair_weight=1.0,
+#            exvol_sigma=0.1
+#        )
+        
+#        return em_score + log_lik
     
+#    def log_prob_fn(flat_coords):
+#        """Combined log probability."""
+#        return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
+
     # 5. Initialize particles (n_particles, n_dims)
     n_particles = 100
     rng_key = jax.random.PRNGKey(42)
@@ -90,7 +176,7 @@ def main():
         rng_key=smc_key,
         n_mcmc_steps=500,
         rmh_sigma=2.0,
-        target_ess=0.5,
+        target_ess=0.7,
         record_best=True,
     )
     

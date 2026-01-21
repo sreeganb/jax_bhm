@@ -1,0 +1,90 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\title{Sequential Bayesian Hierarchical Modeling of Protein Assemblies via SMC}
+\author{Sree Ganesh Balasubramani}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Overview}
+We formulate the integrative structure determination of a protein assembly as a \textbf{Sequential Bayesian Hierarchical Model (SMC-BHM)}. The system consists of $N=32$ rigid particles divided into types A ($N_A=8$), B ($N_B=8$), and C ($N_C=16$). The inference proceeds through a sequence of distributions $\pi_0, \pi_1, \dots, \pi_T$, where each stage introduces a new level of data complexity.
+
+The state vector $\Theta$ includes both the structural coordinates $\mathbf{X} \in \mathbb{R}^{3N}$ and the hierarchical uncertainty parameters $\boldsymbol{\sigma}$:
+\begin{equation}
+    \Theta = \{ \mathbf{X}, \sigma_{\text{pair}}, \sigma_{\text{tet}}, \sigma_{\text{oct}}, \sigma_{\text{EM}} \}
+\end{equation}
+
+\section{Sequential Monte Carlo Framework}
+We approximate the posterior at stage $t$, denoted $\pi_t(\Theta)$, using a population of $M$ weighted particles $\{ \Theta_t^{(m)}, W_t^{(m)} \}_{m=1}^M$. The algorithm proceeds recursively:
+
+\begin{enumerate}
+    \item \textbf{Reweighting:} Compute incremental weights based on the new likelihood component introduced at stage $t$:
+    \begin{equation}
+        w_t^{(m)} = W_{t-1}^{(m)} \times \frac{\pi_t(\Theta_{t-1}^{(m)})}{\pi_{t-1}(\Theta_{t-1}^{(m)})}
+    \end{equation}
+    \item \textbf{Resampling:} If the Effective Sample Size (ESS) falls below a threshold, resample particles with probability proportional to $w_t^{(m)}$.
+    \item \textbf{Mutation:} Propagate particles using a Metropolis-Hastings kernel $\mathcal{K}_t(\cdot | \cdot)$ invariant to $\pi_t$ to restore diversity.
+\end{enumerate}
+
+\section{Sequence of Distributions}
+
+\subsection{Stage 0: The Prior ($\pi_0$)}
+The initial distribution represents the uninformative physical state with no data constraints.
+\begin{equation}
+    \pi_0(\Theta) = \left[ \prod_{i=1}^{N} \mathcal{U}(\mathbf{x}_i \in \text{Box}) \right] \times \prod_{k} P_0(\sigma_k)
+\end{equation}
+where $P_0(\sigma_k)$ is a Jeffrey's prior or Weakly Informative Prior (e.g., Log-Normal) on the uncertainty parameters.
+
+\subsection{Stage 1: Pairwise & Excluded Volume ($\pi_1$)}
+We introduce the fundamental physical constraints: excluded volume and sparse pairwise distance data (AA, AB, BC).
+\begin{equation}
+    \pi_1(\Theta) \propto \pi_0(\Theta) \cdot \mathcal{L}_{\text{excl}}(\mathbf{X}) \cdot \mathcal{L}_{\text{pair}}(\mathbf{X}, \sigma_{\text{pair}})
+\end{equation}
+
+\textbf{Likelihoods:}
+\begin{align}
+    \mathcal{L}_{\text{excl}}(\mathbf{X}) &= \exp\left( -k_{ex} \sum_{i<j} \max(0, R_i + R_j - \|\mathbf{x}_i - \mathbf{x}_j\|)^2 \right) \\
+    \mathcal{L}_{\text{pair}}(\mathbf{X}, \sigma_{\text{pair}}) &= \prod_{(u,v) \in \mathcal{D}_{pair}} \frac{1}{\sqrt{2\pi}\sigma_{\text{pair}}} \exp\left( - \frac{(d_{min}(\mathbf{X}, u, v) - d_{obs})^2}{2\sigma_{\text{pair}}^2} \right)
+\end{align}
+Note: $d_{min}$ accounts for the ambiguity of assigning distances to specific copies in a homo-oligomer (using soft-min or hard-min logic).
+
+\subsection{Stage 2: Tetramer Sub-assembly ($\pi_2$)}
+We introduce high-confidence structural information for the A-B-C-C tetramer unit. This step selects configurations where particles spontaneously arrange into rigid sub-complexes.
+\begin{equation}
+    \pi_2(\Theta) \propto \pi_1(\Theta) \cdot \mathcal{L}_{\text{tet}}(\mathbf{X}, \sigma_{\text{tet}})
+\end{equation}
+
+\textbf{Incremental Weight:}
+\begin{equation}
+    w_2^{(m)} = w_1^{(m)} \cdot \mathcal{L}_{\text{tet}}(\mathbf{X}^{(m)}, \sigma_{\text{tet}}^{(m)})
+\end{equation}
+where $\mathcal{L}_{\text{tet}}$ penalizes deviations of the best-matching local group from the ideal tetramer geometry $\mathbf{X}_{ref}$:
+\begin{equation}
+    \mathcal{L}_{\text{tet}} = \prod_{k=1}^{N_{tet}} \exp\left( - \frac{\text{RMSD}(\text{Group}_k, \mathbf{X}_{ref})^2}{2\sigma_{\text{tet}}^2} \right)
+\end{equation}
+
+\subsection{Stage 3: Octet Symmetry \& Assembly ($\pi_3$)}
+We impose constraints that bind tetramers into the 8-fold symmetric octameric assembly.
+\begin{equation}
+    \pi_3(\Theta) \propto \pi_2(\Theta) \cdot \mathcal{L}_{\text{sym}}(\mathbf{X}) \cdot \mathcal{L}_{\text{inter}}(\mathbf{X}, \sigma_{\text{oct}})
+\end{equation}
+This stage filters the population for structures that exhibit approximate $C_8$ symmetry and satisfy inter-tetramer proximity constraints.
+
+\subsection{Stage 4: Cryo-EM Density ($\pi_4$)}
+The final stage introduces the global shape constraint from Cryo-EM.
+\begin{equation}
+    \pi_4(\Theta) \propto \pi_3(\Theta) \cdot \mathcal{L}_{\text{EM}}(\mathbf{X}, \sigma_{\text{EM}})
+\end{equation}
+\begin{equation}
+    \mathcal{L}_{\text{EM}} \propto \exp\left( \frac{\text{Corr}(\rho_{sim}(\mathbf{X}), \rho_{exp})}{\sigma_{\text{EM}}} \right)
+\end{equation}
+The final population $\{ \Theta_4^{(m)} \}$ represents the full posterior distribution, naturally integrating uncertainties from all levels.
+
+\end{document}

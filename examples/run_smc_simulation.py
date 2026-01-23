@@ -8,7 +8,7 @@ from pathlib import Path
 import mrcfile
 
 # comment the next line to use GPU/TPU if available
-#os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
@@ -163,7 +163,7 @@ def main():
         return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
 
     # 9. Initialize particles (n_particles, n_dims) - start from shifted coords with noise
-    n_particles = 50
+    n_particles = 25
     rng_key = jax.random.PRNGKey(42)
     rng_key, init_key = jax.random.split(rng_key)
     

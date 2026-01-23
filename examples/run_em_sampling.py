@@ -14,14 +14,17 @@ Usage:
     python run_em_sampling.py --generate-mrc     # Generate new MRC from ideal coords
     python run_em_sampling.py --n-steps 1000     # Fewer steps for testing
 """
-import jax.numpy as jnp
-import jax
 import numpy as np
 import sys
 import os
 from pathlib import Path
 import argparse
 import mrcfile
+
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+
+import jax.numpy as jnp
+import jax
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

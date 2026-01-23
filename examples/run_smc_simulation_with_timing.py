@@ -226,7 +226,7 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
     
-    n_particles = 25
+    n_particles = 50
     rng_key = jax.random.PRNGKey(9090)
     rng_key, init_key = jax.random.split(rng_key)
     
@@ -251,9 +251,9 @@ def main():
         log_prob_fn=log_prob_fn,
         initial_positions=initial_positions,
         rng_key=smc_key,
-        n_mcmc_steps=20,
-        rmh_sigma=5.0,
-        target_ess=0.7,
+        n_mcmc_steps=60,
+        rmh_sigma=2.0,
+        target_ess=0.5,
         record_best=True,
     )
     

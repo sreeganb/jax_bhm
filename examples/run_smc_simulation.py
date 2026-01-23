@@ -8,7 +8,7 @@ from pathlib import Path
 import mrcfile
 
 # comment the next line to use GPU/TPU if available
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+#os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
@@ -26,6 +26,8 @@ from scoring.em_score import (
     calculate_ccc_score,
     create_em_log_prob_fn,
 )
+
+print("JAX is using device: ", jax.default_backend())
 
 def compute_density_center_of_mass(density: np.ndarray, voxel_size: float) -> np.ndarray:
     """

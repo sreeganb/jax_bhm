@@ -9,7 +9,7 @@ import mrcfile
 import time
 
 # comment the next line to use GPU/TPU if available
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+#os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
@@ -180,9 +180,12 @@ def main():
     # 4. Setup scoring functions
     # =========================================================================
     timer.start("4. Setup scoring functions")
+
+    # Slope for EM score to keep particles close to the map
+    slope = 0.01
     
     em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=1.0,
-                                         slope=0.01)
+                                         slope=slope)
     radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
     
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
@@ -227,7 +230,7 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
     
-    n_particles = 25
+    n_particles = 50
     rng_key = jax.random.PRNGKey(9090)
     rng_key, init_key = jax.random.split(rng_key)
     
@@ -252,9 +255,9 @@ def main():
         log_prob_fn=log_prob_fn,
         initial_positions=initial_positions,
         rng_key=smc_key,
-        n_mcmc_steps=20,
-        rmh_sigma=5.0,
-        target_ess=0.7,
+        n_mcmc_steps=50,
+        rmh_sigma=3.0,
+        target_ess=0.5,
         record_best=True,
     )
     

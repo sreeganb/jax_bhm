@@ -181,7 +181,8 @@ def main():
     # =========================================================================
     timer.start("4. Setup scoring functions")
     
-    em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=1.0)
+    em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=1.0,
+                                         slope=0.01)
     radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
     
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}

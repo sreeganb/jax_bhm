@@ -188,6 +188,34 @@ def create_em_config_from_arrays(
         voxel_size=voxel_size
     )
 
+@jit
+def calculate_density_com(
+    target_data: jnp.ndarray,
+    bins_x: jnp.ndarray,
+    bins_y: jnp.ndarray,
+    bins_z: jnp.ndarray
+) -> jnp.ndarray:
+    """
+    Calculate center of mass of target density map.
+    Returns (3,) array of COM coordinates.
+    """
+    # Get voxel centers
+    cx = (bins_x[:-1] + bins_x[1:]) / 2
+    cy = (bins_y[:-1] + bins_y[1:]) / 2
+    cz = (bins_z[:-1] + bins_z[1:]) / 2
+    
+    # Create meshgrid (note: target_data is (z, y, x) order)
+    Z, Y, X = jnp.meshgrid(cz, cy, cx, indexing='ij')
+    
+    # Use positive density only
+    density_pos = jnp.maximum(target_data, 0)
+    total_mass = jnp.sum(density_pos)
+    
+    com_x = jnp.sum(X * density_pos) / (total_mass + 1e-10)
+    com_y = jnp.sum(Y * density_pos) / (total_mass + 1e-10)
+    com_z = jnp.sum(Z * density_pos) / (total_mass + 1e-10)
+    
+    return jnp.array([com_x, com_y, com_z])
 
 @jit
 def calculate_ccc_jax(
@@ -197,7 +225,9 @@ def calculate_ccc_jax(
     bins_x: jnp.ndarray,
     bins_y: jnp.ndarray,
     bins_z: jnp.ndarray,
-    resolution: float
+    resolution: float,
+    density_com: jnp.ndarray,
+    slope: float = 0.0
 ) -> float:
     """
     Calculate cross-correlation coefficient for coarse-grained spheres.
@@ -221,8 +251,21 @@ def calculate_ccc_jax(
     # Calculate simulated projection
     projection = calc_projection_jax(coords, weights, bins, resolution)
     
-    # Calculate CCC
-    return compare_data_jax_full(projection, target_data)
+    # calculate CCC
+    ccc = compare_data_jax_full(projection, target_data)
+    
+    # Calculate slope penalty (mean distance to density COM)
+    if slope > 0:
+        distances = jnp.linalg.norm(coords - density_com, axis=1)
+        # Weight by particle volume for consistency
+        weighted_dist = jnp.sum(distances * weights) / jnp.sum(weights)
+        slope_penalty = slope * weighted_dist
+    else:
+        slope_penalty = 0.0
+    
+    # CCC is in [-1, 1], slope_penalty is in [0, inf)
+    # Return combined score (higher = better)
+    return ccc - slope_penalty
 
 
 def calculate_ccc_score(
@@ -289,7 +332,10 @@ def em_log_probability(
     return scale * ccc
 
 
-def create_em_log_prob_fn(config: EMConfig, radii: np.ndarray, scale: float = 100.0):
+def create_em_log_prob_fn(config: EMConfig, 
+                          radii: np.ndarray, 
+                          scale: float = 100.0,
+                          slope: float = 0.0):
     """
     Create a log probability function compatible with MCMC samplers.
     
@@ -300,7 +346,7 @@ def create_em_log_prob_fn(config: EMConfig, radii: np.ndarray, scale: float = 10
         config: EMConfig with target density and grid info
         radii: (N,) particle radii (fixed during sampling)
         scale: CCC to log-prob scaling factor
-    
+        slope: Slope penalty factor
     Returns:
         Function: flat_coords (N*3,) -> log_probability
     
@@ -312,16 +358,30 @@ def create_em_log_prob_fn(config: EMConfig, radii: np.ndarray, scale: float = 10
     """
     radii_jax = jnp.array(radii, dtype=jnp.float32)
     
+    # Pre-compute density COM (only once!)
+    density_com = calculate_density_com(
+        config.target_data,
+        config.bins_x, config.bins_y, config.bins_z
+    )
+    
     @jit
     def log_prob_fn(flat_coords: jnp.ndarray) -> float:
         coords = flat_coords.reshape(-1, 3)
-        return em_log_probability(
+        
+        # CCC with slope
+        score = calculate_ccc_jax(
             coords, radii_jax,
             config.target_data,
             config.bins_x, config.bins_y, config.bins_z,
             config.resolution,
-            scale
+            density_com,
+            slope
         )
+        
+        # Convert to log probability
+        # score is CCC - slope_penalty, range approximately [-1 - penalty, 1]
+        # We want higher score = higher log prob
+        return scale * score
     
     return log_prob_fn
 

@@ -182,11 +182,11 @@ def main():
     timer.start("4. Setup scoring functions")
 
     # Slope for EM score to keep particles close to the map
-    slope = 0.01
+    slope = 0.1
     
     # EM score: returns scale * CCC (log-probability, higher = better)
-    em_scale = 100.0
-    em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=em_scale, slope=0.01)
+    em_scale = 500.0
+    em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=em_scale, slope=slope)
     radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
     
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
@@ -214,7 +214,7 @@ def main():
         structure_log_prob = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=0.1
+            exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=1.0
         )
         
         return em_log_prob_value + structure_log_prob
@@ -242,7 +242,7 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
     
-    n_particles = 50
+    n_particles = 100
     rng_key = jax.random.PRNGKey(9090)
     rng_key, init_key = jax.random.split(rng_key)
     
@@ -268,8 +268,8 @@ def main():
         initial_positions=initial_positions,
         rng_key=smc_key,
         n_mcmc_steps=50,
-        rmh_sigma=3.0,
-        target_ess=0.5,
+        rmh_sigma=4.0,
+        target_ess=0.7,
         record_best=True,
     )
     

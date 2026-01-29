@@ -272,7 +272,8 @@ def calculate_ccc_jax(
 def calculate_ccc_score(
     coords: np.ndarray,
     radii: np.ndarray,
-    config: EMConfig
+    config: EMConfig,
+    slope: float = 0.0
 ) -> float:
     """
     Calculate CCC score (convenience wrapper).
@@ -287,12 +288,16 @@ def calculate_ccc_score(
     """
     coords_jax = jnp.array(coords, dtype=jnp.float32)
     radii_jax = jnp.array(radii, dtype=jnp.float32)
+    density_com = getattr(config, "density_com", jnp.zeros((3,), dtype=jnp.float32))
+
     
     ccc = calculate_ccc_jax(
         coords_jax, radii_jax,
         config.target_data,
         config.bins_x, config.bins_y, config.bins_z,
-        config.resolution
+        config.resolution,
+        density_com,
+        slope=0.0
     )
     return float(ccc)
 
@@ -340,26 +345,12 @@ def create_em_log_prob_fn(config: EMConfig,
     """
     Create a log probability function compatible with MCMC samplers.
     
-    The returned function takes flat coordinates (N*3,) and returns log probability.
-    Radii are fixed (baked into the closure).
+    Returns: scale * (CCC - slope_penalty)
     
-    Args:
-        config: EMConfig with target density and grid info
-        radii: (N,) particle radii (fixed during sampling)
-        scale: CCC to log-prob scaling factor
-        slope: Slope penalty factor
-    Returns:
-        Function: flat_coords (N*3,) -> log_probability
-    
-    Example:
-        >>> config = create_em_config_from_mrcfile(density, resolution=50.0)
-        >>> radii = np.array([24.0]*8 + [14.0]*8 + [16.0]*16)
-        >>> log_prob_fn = create_em_log_prob_fn(config, radii)
-        >>> log_prob = log_prob_fn(coords.flatten())
+    Higher values = better fit (for MCMC maximization).
     """
     radii_jax = jnp.array(radii, dtype=jnp.float32)
     
-    # Pre-compute density COM (only once!)
     density_com = calculate_density_com(
         config.target_data,
         config.bins_x, config.bins_y, config.bins_z
@@ -369,8 +360,8 @@ def create_em_log_prob_fn(config: EMConfig,
     def log_prob_fn(flat_coords: jnp.ndarray) -> float:
         coords = flat_coords.reshape(-1, 3)
         
-        # CCC with slope
-        score = calculate_ccc_jax(
+        # CCC with optional slope penalty
+        ccc = calculate_ccc_jax(
             coords, radii_jax,
             config.target_data,
             config.bins_x, config.bins_y, config.bins_z,
@@ -379,10 +370,8 @@ def create_em_log_prob_fn(config: EMConfig,
             slope
         )
         
-        # Convert to log probability
-        # score is CCC - slope_penalty, range approximately [-1 - penalty, 1]
-        # We want higher score = higher log prob
-        return scale * score
+        # Return scaled log-prob (higher CCC = higher log-prob)
+        return scale * ccc
     
     return log_prob_fn
 

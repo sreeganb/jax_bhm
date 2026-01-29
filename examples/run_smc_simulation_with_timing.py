@@ -184,8 +184,9 @@ def main():
     # Slope for EM score to keep particles close to the map
     slope = 0.01
     
-    em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=1.0,
-                                         slope=slope)
+    # EM score: returns scale * CCC (log-probability, higher = better)
+    em_scale = 100.0
+    em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=em_scale, slope=0.01)
     radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
     
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
@@ -193,22 +194,33 @@ def main():
     box_size = 500.0
     
     def log_prior_fn(flat_coords):
+        """Log prior: uniform in box, -inf outside."""
         coords = flat_coords.reshape(-1, 3)
         in_box = jnp.all((coords >= -box_size) & (coords <= box_size))
         return jnp.where(in_box, 0.0, -jnp.inf)
     
     @jax.jit
     def log_likelihood_fn(flat_coords):
-        ccc = em_log_prob(flat_coords)
-        em_score = -(1.0 - ccc)
-        log_lik = log_probability(
+        """
+        Log likelihood = EM log-prob + pair/exvol log-prob
+        
+        Both terms return higher values for better configurations.
+        """
+        # EM term: scale * CCC (higher CCC = higher log-prob)
+        em_log_prob_value = em_log_prob(flat_coords)
+        
+        # Pair + excluded volume term: -(ev_penalty + pair_nll)
+        # Already returns log-probability (negative of penalties)
+        structure_log_prob = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
             exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=0.1
         )
-        return em_score + log_lik
+        
+        return em_log_prob_value + structure_log_prob
     
     def log_prob_fn(flat_coords):
+        """Total log probability = log_prior + log_likelihood."""
         return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
     
     timer.stop("4. Setup scoring functions")

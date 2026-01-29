@@ -253,18 +253,19 @@ def calculate_ccc_jax(
     
     # calculate CCC
     ccc = compare_data_jax_full(projection, target_data)
-    
-    # Calculate slope penalty (mean distance to density COM)
-    if slope > 0:
+
+    def _with_slope(_):
         distances = jnp.linalg.norm(coords - density_com, axis=1)
-        # Weight by particle volume for consistency
         weighted_dist = jnp.sum(distances * weights) / jnp.sum(weights)
-        slope_penalty = slope * weighted_dist
-    else:
-        slope_penalty = 0.0
-    
-    # CCC is in [-1, 1], slope_penalty is in [0, inf)
-    # Return combined score (higher = better)
+        return slope * weighted_dist
+
+    slope_penalty = jax.lax.cond(
+        slope > 0.0,
+        _with_slope,
+        lambda _: 0.0,
+        operand=None
+    )
+
     return ccc - slope_penalty
 
 

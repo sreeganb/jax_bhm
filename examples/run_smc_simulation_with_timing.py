@@ -9,7 +9,7 @@ import mrcfile
 import time
 
 # comment the next line to use GPU/TPU if available
-#os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
@@ -185,85 +185,27 @@ def main():
     radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
     
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
+    nuisance_params = {'AA': 1.6, 'AB': 1.4, 'BC': 1.0}
     box_size = 500.0
-
-    # ---- NEW: nuisance parameter prior config ----
-    sigma_keys = ['AA', 'AB', 'BC']
-
-    # Per-parameter mean/std for truncated normal
-    sigma_mu = {'AA': 2.0, 'AB': 1.6, 'BC': 1.1}
-    sigma_sd = {'AA': 1.1, 'AB': 1.0, 'BC': 0.9}
-    trunc_a, trunc_b = 0.0, 5.0  # for truncnorm in standardized units
-
-    # Per-parameter alpha/beta for inverse-gamma (shape/scale)
-    invgamma_alpha = {'AA': 3.0, 'AB': 2.5, 'BC': 4.0}
-    invgamma_beta  = {'AA': 6.0, 'AB': 5.0, 'BC': 7.0}
-
-    # Per-parameter scale for half-Cauchy
-    halfcauchy_scale = {'AA': 2.0, 'AB': 1.5, 'BC': 3.0}
-
-    # Select which prior to use: "truncnorm", "invgamma", or "halfcauchy"
-    sigma_prior_type = "truncnorm"
-
-    def unpack_state(state):
-        coords = state[:-3]
-        sigma = state[-3:]  # [sigma_aa, sigma_ab, sigma_bc]
-        return coords, sigma
-
-    def log_prior_sigma(sigma):
-        # sigma is a length-3 vector in order AA, AB, BC
-        logp = 0.0
-        for i, key in enumerate(sigma_keys):
-            x = sigma[i]
-            if sigma_prior_type == "truncnorm":
-                loc = sigma_mu[key]
-                scale = sigma_sd[key]
-                logp += jax.scipy.stats.truncnorm.logpdf(
-                    x, a=trunc_a, b=trunc_b, loc=loc, scale=scale
-                )
-            elif sigma_prior_type == "invgamma":
-                # logpdf for Inverse-Gamma(alpha, beta)
-                a = invgamma_alpha[key]
-                b = invgamma_beta[key]
-                # log p(x) = a*log(b) - lgamma(a) - (a+1)log(x) - b/x
-                logp += a * jnp.log(b) - jax.scipy.special.gammaln(a) - (a + 1.0) * jnp.log(x) - b / x
-            elif sigma_prior_type == "halfcauchy":
-                # logpdf for Half-Cauchy(scale)
-                s = halfcauchy_scale[key]
-                # p(x) = 2 / (pi*s*(1 + (x/s)^2)), x>0
-                logp += jnp.log(2.0) - jnp.log(jnp.pi * s) - jnp.log1p((x / s) ** 2)
-            else:
-                raise ValueError(f"Unknown sigma prior: {sigma_prior_type}")
-        return logp
-
-    def log_prior_fn(state):
-        coords, sigma = unpack_state(state)
-
-        coords_reshaped = coords.reshape(-1, 3)
-        in_box = jnp.all((coords_reshaped >= -box_size) & (coords_reshaped <= box_size))
-        logp_coords = jnp.where(in_box, 0.0, -jnp.inf)
-
-        logp_sigma = log_prior_sigma(sigma)
-        return logp_coords + logp_sigma
+    
+    def log_prior_fn(flat_coords):
+        coords = flat_coords.reshape(-1, 3)
+        in_box = jnp.all((coords >= -box_size) & (coords <= box_size))
+        return jnp.where(in_box, 0.0, -jnp.inf)
     
     @jax.jit
-    def log_likelihood_fn(state):
-        coords, sigma = unpack_state(state)
-
-        nuisance_params = {'AA': sigma[0], 'AB': sigma[1], 'BC': sigma[2]}
-
-        ccc = em_log_prob(coords)
+    def log_likelihood_fn(flat_coords):
+        ccc = em_log_prob(flat_coords)
         em_score = -(1.0 - ccc)
-
         log_lik = log_probability(
-            coords, system, flat_radii,
+            flat_coords, system, flat_radii,
             target_dists, nuisance_params,
             exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=0.1
         )
         return em_score + log_lik
     
-    def log_prob_fn(state):
-        return log_prior_fn(state) + log_likelihood_fn(state)
+    def log_prob_fn(flat_coords):
+        return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
     
     timer.stop("4. Setup scoring functions")
     
@@ -272,39 +214,9 @@ def main():
     # =========================================================================
     timer.start("5. JIT compilation (warmup)")
     
-    # Force JIT compilation by running once with full state (coords + sigma)
+    # Force JIT compilation by running once
     dummy_coords = system.flatten(shifted_coords)
-
-    if sigma_prior_type == "truncnorm":
-        z = jax.random.truncated_normal(jax.random.PRNGKey(0), lower=trunc_a, upper=trunc_b, shape=(3,))
-        dummy_sigma = jnp.array([
-            sigma_mu['AA'] + sigma_sd['AA'] * z[0],
-            sigma_mu['AB'] + sigma_sd['AB'] * z[1],
-            sigma_mu['BC'] + sigma_sd['BC'] * z[2],
-        ])
-    elif sigma_prior_type == "invgamma":
-        key = jax.random.PRNGKey(0)
-        g_aa = jax.random.gamma(key, invgamma_alpha['AA'])
-        g_ab = jax.random.gamma(key, invgamma_alpha['AB'])
-        g_bc = jax.random.gamma(key, invgamma_alpha['BC'])
-        dummy_sigma = jnp.array([
-            invgamma_beta['AA'] / g_aa,
-            invgamma_beta['AB'] / g_ab,
-            invgamma_beta['BC'] / g_bc,
-        ])
-    elif sigma_prior_type == "halfcauchy":
-        key = jax.random.PRNGKey(0)
-        c = jax.random.cauchy(key, (3,))
-        dummy_sigma = jnp.array([
-            jnp.abs(c[0]) * halfcauchy_scale['AA'],
-            jnp.abs(c[1]) * halfcauchy_scale['AB'],
-            jnp.abs(c[2]) * halfcauchy_scale['BC'],
-        ])
-    else:
-        raise ValueError(f"Unknown sigma prior: {sigma_prior_type}")
-
-    dummy_state = jnp.concatenate([dummy_coords, dummy_sigma], axis=0)
-    _ = log_prob_fn(dummy_state)
+    _ = log_prob_fn(dummy_coords)
     jax.block_until_ready(_)
     
     timer.stop("5. JIT compilation (warmup)")
@@ -314,47 +226,13 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
     
-    n_particles = 50
+    n_particles = 25
     rng_key = jax.random.PRNGKey(9090)
     rng_key, init_key = jax.random.split(rng_key)
     
     flat_shifted = system.flatten(shifted_coords)
-
-    # ---- NEW: sample sigma from chosen prior ----
-    rng_key, sigma_key = jax.random.split(rng_key)
-
-    if sigma_prior_type == "truncnorm":
-        # sample standard truncnorm, then scale/shift per parameter
-        z = jax.random.truncated_normal(sigma_key, lower=trunc_a, upper=trunc_b, shape=(n_particles, 3))
-        sigma_samples = []
-        for i, key in enumerate(sigma_keys):
-            sigma_samples.append(sigma_mu[key] + sigma_sd[key] * z[:, i])
-        sigma_samples = jnp.stack(sigma_samples, axis=1)
-
-    elif sigma_prior_type == "invgamma":
-        # sample x ~ InvGamma(alpha, beta) by x = beta / Gamma(alpha, 1)
-        sigma_samples = []
-        for i, key in enumerate(sigma_keys):
-            a = invgamma_alpha[key]
-            b = invgamma_beta[key]
-            g = jax.random.gamma(sigma_key, a, shape=(n_particles,))
-            sigma_samples.append(b / g)
-        sigma_samples = jnp.stack(sigma_samples, axis=1)
-
-    elif sigma_prior_type == "halfcauchy":
-        # sample x = |Cauchy(0, s)|
-        sigma_samples = []
-        for i, key in enumerate(sigma_keys):
-            s = halfcauchy_scale[key]
-            c = jax.random.cauchy(sigma_key, shape=(n_particles,))
-            sigma_samples.append(jnp.abs(c) * s)
-        sigma_samples = jnp.stack(sigma_samples, axis=1)
-    else:
-        raise ValueError(f"Unknown sigma prior: {sigma_prior_type}")
-
-    coord_samples = flat_shifted + jax.random.normal(init_key, (n_particles, n_dims)) * 10.0
-    initial_positions = jnp.concatenate([coord_samples, sigma_samples], axis=1)
-
+    initial_positions = flat_shifted + jax.random.normal(init_key, (n_particles, n_dims)) * 10.0
+    
     init_scores = jax.vmap(log_prob_fn)(initial_positions)
     jax.block_until_ready(init_scores)
     print(f"\nInitial Score (mean): {jnp.mean(init_scores):.2f}")
@@ -373,9 +251,9 @@ def main():
         log_prob_fn=log_prob_fn,
         initial_positions=initial_positions,
         rng_key=smc_key,
-        n_mcmc_steps=60,
-        rmh_sigma=2.0,
-        target_ess=0.5,
+        n_mcmc_steps=20,
+        rmh_sigma=5.0,
+        target_ess=0.7,
         record_best=True,
     )
     

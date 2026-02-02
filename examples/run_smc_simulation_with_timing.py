@@ -126,8 +126,12 @@ def main():
     timer.start("3. Initialize coordinates")
     
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
+    
+    # Initialize particles centered at origin, within a smaller box
+    # to ensure they stay inside the ±500 box constraint after noise is added
+    init_box_size = 200.0  # Smaller initial box
     coords = temp_system.get_random_coords(
-        jax.random.PRNGKey(9090), box_size=[500.0, 500.0, 500.0]
+        jax.random.PRNGKey(9090), box_size=[init_box_size, init_box_size, init_box_size]
     )
     
     system = ParticleSystem(types_config, coords, ideal_coords)
@@ -213,11 +217,23 @@ def main():
     rng_key, init_key = jax.random.split(rng_key)
     
     flat_init = system.flatten(coords)
-    initial_positions = flat_init + jax.random.normal(init_key, (n_particles, n_dims)) * 10.0
     
+    # Smaller noise to keep particles valid
+    initial_positions = flat_init + jax.random.normal(init_key, (n_particles, n_dims)) * 5.0
+    
+    # Check how many particles are valid
     init_scores = jax.vmap(log_prob_fn)(initial_positions)
+    valid_count = jnp.sum(jnp.isfinite(init_scores))
     jax.block_until_ready(init_scores)
-    print(f"\nInitial Score (mean): {jnp.mean(init_scores):.2f}")
+    
+    print(f"\nValid particles: {int(valid_count)}/{n_particles}")
+    print(f"Initial Score (mean of valid): {jnp.nanmean(jnp.where(jnp.isfinite(init_scores), init_scores, jnp.nan)):.2f}")
+    
+    # Debug: check coordinate ranges
+    coords_3d = flat_init.reshape(-1, 3)
+    print(f"Coord ranges: X[{float(coords_3d[:,0].min()):.1f}, {float(coords_3d[:,0].max()):.1f}], "
+          f"Y[{float(coords_3d[:,1].min()):.1f}, {float(coords_3d[:,1].max()):.1f}], "
+          f"Z[{float(coords_3d[:,2].min()):.1f}, {float(coords_3d[:,2].max()):.1f}]")
     
     timer.stop("6. Initialize SMC particles")
     

@@ -76,33 +76,6 @@ class WallTimer:
         print("=" * 60)
 
 
-# =============================================================================
-# Helper functions
-# =============================================================================
-
-def compute_density_center_of_mass(density: np.ndarray, voxel_size: float) -> np.ndarray:
-    """Compute center of mass of density map."""
-    nz, ny, nx = density.shape
-    half_x, half_y, half_z = nx * voxel_size / 2, ny * voxel_size / 2, nz * voxel_size / 2
-    
-    x = np.linspace(-half_x + voxel_size/2, half_x - voxel_size/2, nx)
-    y = np.linspace(-half_y + voxel_size/2, half_y - voxel_size/2, ny)
-    z = np.linspace(-half_z + voxel_size/2, half_z - voxel_size/2, nz)
-    
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-    density_pos = np.maximum(density, 0)
-    total_mass = np.sum(density_pos)
-    
-    if total_mass < 1e-10:
-        return np.array([0.0, 0.0, 0.0])
-    
-    return np.array([
-        np.sum(X * density_pos) / total_mass,
-        np.sum(Y * density_pos) / total_mass,
-        np.sum(Z * density_pos) / total_mass
-    ])
-
-
 def main():
     # Initialize timer
     timer = WallTimer()
@@ -141,12 +114,8 @@ def main():
     print(f"\nLoading target density: {mrc_path}")
     with mrcfile.open(str(mrc_path), mode='r') as mrc:
         em_config = create_em_config_from_mrcfile(mrc, resolution)
-        density_data = mrc.data.copy()
         density_voxel_size = float(mrc.voxel_size.x)
         print(f"  Shape: {mrc.data.shape}, Voxel: {density_voxel_size:.2f} Å")
-    
-    density_com = compute_density_center_of_mass(density_data, density_voxel_size)
-    print(f"  Density COM: [{density_com[0]:.2f}, {density_com[1]:.2f}, {density_com[2]:.2f}] Å")
     
     timer.stop("2. Load density map")
     
@@ -160,15 +129,7 @@ def main():
         jax.random.PRNGKey(9090), box_size=[500.0, 500.0, 500.0]
     )
     
-    # Shift to density COM
-    identity_order = sorted(types_config.keys())
-    coords_array = jnp.concatenate([coords[k] for k in identity_order], axis=0)
-    coords_com = jnp.mean(coords_array, axis=0)
-    shift_vector = density_com - np.array(coords_com)
-    
-    shifted_coords = {k: coords[k] + jnp.array(shift_vector) for k in coords}
-    
-    system = ParticleSystem(types_config, shifted_coords, ideal_coords)
+    system = ParticleSystem(types_config, coords, ideal_coords)
     flat_radii = system.get_flat_radii()
     n_dims = system.total_particles * 3
     
@@ -223,6 +184,14 @@ def main():
         """Total log probability = log_prior + log_likelihood."""
         return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
     
+    # Create a function to compute raw CCC (without scale) for reporting
+    @jax.jit
+    def compute_ccc(flat_coords):
+        """Compute raw CCC score for a configuration."""
+        coords_3d = flat_coords.reshape(-1, 3)
+        sim_density = calc_projection_jax(coords_3d, radii_jax, em_config)
+        return calculate_ccc_score(sim_density, em_config.target_density)
+    
     timer.stop("4. Setup scoring functions")
     
     # =========================================================================
@@ -231,8 +200,9 @@ def main():
     timer.start("5. JIT compilation (warmup)")
     
     # Force JIT compilation by running once
-    dummy_coords = system.flatten(shifted_coords)
+    dummy_coords = system.flatten(coords)
     _ = log_prob_fn(dummy_coords)
+    _ = compute_ccc(dummy_coords)
     jax.block_until_ready(_)
     
     timer.stop("5. JIT compilation (warmup)")
@@ -246,8 +216,8 @@ def main():
     rng_key = jax.random.PRNGKey(9090)
     rng_key, init_key = jax.random.split(rng_key)
     
-    flat_shifted = system.flatten(shifted_coords)
-    initial_positions = flat_shifted + jax.random.normal(init_key, (n_particles, n_dims)) * 10.0
+    flat_init = system.flatten(coords)
+    initial_positions = flat_init + jax.random.normal(init_key, (n_particles, n_dims)) * 10.0
     
     init_scores = jax.vmap(log_prob_fn)(initial_positions)
     jax.block_until_ready(init_scores)
@@ -292,6 +262,20 @@ def main():
     print(f"\nFinal Score (mean): {jnp.mean(final_scores):.2f}")
     print(f"Best Score: {best_score:.2f}")
     
+    # Print CCC for each step's best particle
+    if best_positions is not None and best_scores is not None:
+        print("\n" + "=" * 60)
+        print("CCC Score per SMC Step (Best Particle)")
+        print("=" * 60)
+        print(f"{'Step':<8} {'Score':>12} {'CCC':>12}")
+        print("-" * 60)
+        
+        for step_idx, (pos, score) in enumerate(zip(best_positions, best_scores)):
+            ccc_value = compute_ccc(jnp.array(pos))
+            print(f"{step_idx:<8} {score:>12.2f} {float(ccc_value):>12.4f}")
+        
+        print("=" * 60)
+    
     timer.stop("8. Post-processing")
     
     # =========================================================================
@@ -300,9 +284,6 @@ def main():
     timer.start("9. Save results")
     
     if best_positions is not None and best_scores is not None:
-        diffs = np.linalg.norm(np.diff(np.array(best_positions), axis=0), axis=1)
-        print(f"Best-step motion: min={diffs.min():.4f}, max={diffs.max():.4f}, mean={diffs.mean():.4f}")
-
         output_file = output_dir / "smc_trajectory.h5"
         save_mcmc_to_hdf5(
             np.array(best_positions),

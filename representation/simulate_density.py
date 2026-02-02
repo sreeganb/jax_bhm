@@ -73,7 +73,8 @@ def create_simulated_density(
     resolution: float,
     grid_spacing: float,
     padding: float = 50.0,
-    output_file: str = "simulated_density.mrc"
+    output_file: str = "simulated_density.mrc",
+    weight_power: float = 1.0,
 ):
     """
     Create simulated density map from particle coordinates.
@@ -85,15 +86,16 @@ def create_simulated_density(
         grid_spacing: Voxel size in Angstroms
         padding: Padding around structure in Angstroms
         output_file: Output MRC filename
+        weight_power: Power for radius weighting (1=linear, 2=area, 3=volume)
     """
-    # Collect all coordinates and weights (radius^3 for volume)
+    # Collect all coordinates and weights
     all_coords = []
     all_weights = []
     
     for ptype in sorted(coords_dict.keys()):
         coords = coords_dict[ptype]
         radius = types_config[ptype]['radius']
-        weight = radius ** 3  # Volume-based weight
+        weight = radius ** weight_power
         
         all_coords.append(coords)
         all_weights.extend([weight] * len(coords))
@@ -128,6 +130,7 @@ def create_simulated_density(
     print(f"  Grid spacing: {grid_spacing:.1f} Å")
     print(f"  Grid size: {n_bins} x {n_bins} x {n_bins}")
     print(f"  Grid extent: [{-half_extent:.1f}, {half_extent:.1f}] Å")
+    print(f"  Weight power: {weight_power}")
     
     # Create weighted histogram
     histogram, _ = np.histogramdd(coords, bins=[bins_x, bins_y, bins_z], weights=weights)
@@ -169,12 +172,14 @@ def main():
     parser = argparse.ArgumentParser(description="Create simulated density from ideal coordinates")
     parser.add_argument("--resolution", type=float, default=40.0,
                         help="Map resolution in Angstroms (default: 40)")
-    parser.add_argument("--grid-spacing", type=float, default=4.0,
-                        help="Voxel size in Angstroms (default: 4)")
+    parser.add_argument("--grid-spacing", type=float, default=5.0,
+                        help="Voxel size in Angstroms (default: 5)")
     parser.add_argument("--padding", type=float, default=50.0,
                         help="Padding around structure in Angstroms (default: 50)")
     parser.add_argument("--output", type=str, default="output/simulated_target_density.mrc",
                         help="Output MRC file path")
+    parser.add_argument("--weight-power", type=float, default=1.0,
+                        help="Power for radius weighting: 1=linear, 2=area, 3=volume (default: 1)")
     args = parser.parse_args()
     
     # Create output directory
@@ -194,7 +199,8 @@ def main():
         resolution=args.resolution,
         grid_spacing=args.grid_spacing,
         padding=args.padding,
-        output_file=args.output
+        output_file=args.output,
+        weight_power=args.weight_power,
     )
     
     print("\nDone!")

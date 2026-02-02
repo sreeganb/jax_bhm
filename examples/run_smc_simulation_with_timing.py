@@ -28,6 +28,7 @@ from scoring.em_score import (
     calc_projection_jax,
     calculate_ccc_score,
     create_em_log_prob_fn,
+    pairwise_correlation_jax,
 )
 
 
@@ -189,8 +190,10 @@ def main():
     def compute_ccc(flat_coords):
         """Compute raw CCC score for a configuration."""
         coords_3d = flat_coords.reshape(-1, 3)
-        sim_density = calc_projection_jax(coords_3d, radii_jax, em_config)
-        return calculate_ccc_score(sim_density, em_config.target_density)
+        weights = radii_jax ** 3
+        bins = (em_config.bins_x, em_config.bins_y, em_config.bins_z)
+        sim_density = calc_projection_jax(coords_3d, weights, bins, em_config.resolution)
+        return pairwise_correlation_jax(sim_density.flatten(), em_config.target_data.flatten())
     
     timer.stop("4. Setup scoring functions")
     

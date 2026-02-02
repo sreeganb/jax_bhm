@@ -373,8 +373,39 @@ def create_em_log_prob_fn(config: EMConfig,
         # Return scaled log-prob (higher CCC = higher log-prob)
         return scale * ccc
     
+    @jit
+    def log_prob_with_ccc_fn(flat_coords: jnp.ndarray) -> Tuple[float, float]:
+        """Returns (log_prob, raw_ccc)."""
+        coords = flat_coords.reshape(-1, 3)
+        
+        # Compute CCC (without slope penalty for raw value)
+        weights = radii_jax ** 3
+        bins = (config.bins_x, config.bins_y, config.bins_z)
+        projection = calc_projection_jax(coords, weights, bins, config.resolution)
+        raw_ccc = compare_data_jax_full(projection, config.target_data)
+        
+        # Apply slope penalty if needed
+        def _with_slope(_):
+            distances = jnp.linalg.norm(coords - density_com, axis=1)
+            weighted_dist = jnp.sum(distances * weights) / jnp.sum(weights)
+            return slope * weighted_dist
+        
+        slope_penalty = jax.lax.cond(
+            slope > 0.0,
+            _with_slope,
+            lambda _: 0.0,
+            operand=None
+        )
+        
+        ccc_with_penalty = raw_ccc - slope_penalty
+        log_prob = scale * ccc_with_penalty
+        
+        return log_prob, raw_ccc
+    
+    # Attach the extended function as an attribute
+    log_prob_fn.with_ccc = log_prob_with_ccc_fn
+    
     return log_prob_fn
-
 
 def create_em_energy_fn(config: EMConfig, radii: np.ndarray, scale: float = 100.0):
     """

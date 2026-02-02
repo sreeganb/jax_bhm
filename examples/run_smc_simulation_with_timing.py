@@ -185,15 +185,8 @@ def main():
         """Total log probability = log_prior + log_likelihood."""
         return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
     
-    # Create a function to compute raw CCC (without scale) for reporting
-    @jax.jit
-    def compute_ccc(flat_coords):
-        """Compute raw CCC score for a configuration."""
-        coords_3d = flat_coords.reshape(-1, 3)
-        weights = radii_jax ** 3
-        bins = (em_config.bins_x, em_config.bins_y, em_config.bins_z)
-        sim_density = calc_projection_jax(coords_3d, weights, bins, em_config.resolution)
-        return pairwise_correlation_jax(sim_density.flatten(), em_config.target_data.flatten())
+    # Function to get CCC without recomputing projection
+    get_ccc = jax.jit(lambda x: em_log_prob.with_ccc(x)[1])
     
     timer.stop("4. Setup scoring functions")
     
@@ -205,7 +198,7 @@ def main():
     # Force JIT compilation by running once
     dummy_coords = system.flatten(coords)
     _ = log_prob_fn(dummy_coords)
-    _ = compute_ccc(dummy_coords)
+    _ = get_ccc(dummy_coords)
     jax.block_until_ready(_)
     
     timer.stop("5. JIT compilation (warmup)")
@@ -274,7 +267,7 @@ def main():
         print("-" * 60)
         
         for step_idx, (pos, score) in enumerate(zip(best_positions, best_scores)):
-            ccc_value = compute_ccc(jnp.array(pos))
+            ccc_value = get_ccc(jnp.array(pos))
             print(f"{step_idx:<8} {score:>12.2f} {float(ccc_value):>12.4f}")
         
         print("=" * 60)

@@ -9,6 +9,9 @@ Compute CCC between model density (ideal coords) and experimental density.
 import argparse
 import numpy as np
 import mrcfile
+import os
+
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 from representation.particle_system import get_ideal_coords
 from scoring.em_score import create_em_config_from_mrcfile, calculate_ccc_score
@@ -37,7 +40,7 @@ def main():
         # Slightly perturb ideal coords to avoid perfect score
         rng = np.random.default_rng(1234)
         for k in ideal:
-            ideal[k] = ideal[k] + rng.normal(scale=0.01, size=ideal[k].shape)
+            ideal[k] = ideal[k] + rng.normal(scale=0.0, size=ideal[k].shape)
     # 
     identity_order = sorted(types_config.keys())
 

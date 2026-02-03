@@ -129,7 +129,7 @@ def main():
     
     # Initialize particles centered at origin, within a smaller box
     # to ensure they stay inside the ±500 box constraint after noise is added
-    init_box_size = 200.0  # Smaller initial box
+    init_box_size = 300.0  # Smaller initial box
     coords = temp_system.get_random_coords(
         jax.random.PRNGKey(9090), box_size=[init_box_size, init_box_size, init_box_size]
     )
@@ -148,16 +148,16 @@ def main():
     timer.start("4. Setup scoring functions")
 
     # Slope for EM score to keep particles close to the map
-    slope = 0.1
+    slope = 0.15
     
     # EM score: returns scale * CCC (log-probability, higher = better)
-    em_scale = 500.0
+    em_scale = 100.0
     em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=em_scale, slope=slope)
     radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
     
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
     nuisance_params = {'AA': 1.6, 'AB': 1.4, 'BC': 1.0}
-    box_size = 500.0
+    box_size = 300.0
     
     def log_prior_fn(flat_coords):
         """Log prior: uniform in box, -inf outside."""
@@ -180,7 +180,7 @@ def main():
         structure_log_prob = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=1.0
+            exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=0.10
         )
         
         return em_log_prob_value + structure_log_prob
@@ -212,7 +212,7 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
     
-    n_particles = 100
+    n_particles = 25
     rng_key = jax.random.PRNGKey(9090)
     rng_key, init_key = jax.random.split(rng_key)
     
@@ -249,9 +249,9 @@ def main():
         log_prob_fn=log_prob_fn,
         initial_positions=initial_positions,
         rng_key=smc_key,
-        n_mcmc_steps=50,
-        rmh_sigma=4.0,
-        target_ess=0.7,
+        n_mcmc_steps=100,
+        rmh_sigma=2.0,
+        target_ess=0.8,
         record_best=True,
     )
     

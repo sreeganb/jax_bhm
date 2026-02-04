@@ -9,7 +9,7 @@ import mrcfile
 import time
 
 # comment the next line to use GPU/TPU if available
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+#os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
@@ -124,9 +124,9 @@ def main():
     
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
     
-    init_box_size = 300.0
+    init_box_size = 500.0
     coords = temp_system.get_random_coords(
-        jax.random.PRNGKey(9090), box_size=[init_box_size, init_box_size, init_box_size]
+        jax.random.PRNGKey(128907189), box_size=[init_box_size, init_box_size, init_box_size]
     )
     
     system = ParticleSystem(types_config, coords, ideal_coords)
@@ -142,14 +142,14 @@ def main():
     # =========================================================================
     timer.start("4. Setup scoring functions")
 
-    slope = 0.15
-    em_scale = 100.0
+    slope = 0.05
+    em_scale = 500.0
     em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=em_scale, slope=slope)
     radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
     
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
     nuisance_params = {'AA': 1.3, 'AB': 1.1, 'BC': 1.0}
-    box_size = 300.0
+    box_size = 500.0
     
     def log_prior_fn(flat_coords):
         """Log prior: uniform in box, -inf outside."""
@@ -164,7 +164,7 @@ def main():
         structure_log_prob = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=0.10
+            exclusion_weight=1.0, pair_weight=2.0, exvol_sigma=0.10
         )
         return em_log_prob_value + structure_log_prob
     
@@ -198,8 +198,8 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
     
-    n_particles = 25
-    rng_key = jax.random.PRNGKey(9090)
+    n_particles = 200
+    rng_key = jax.random.PRNGKey(90998210)
     rng_key, init_key = jax.random.split(rng_key)
     
     flat_init = system.flatten(coords)
@@ -231,9 +231,9 @@ def main():
         log_prob_fn=log_prob_fn,
         initial_positions=initial_positions,
         rng_key=smc_key,
-        n_mcmc_steps=100,
-        rmh_sigma=2.0,
-        target_ess=0.8,
+        n_mcmc_steps=200,
+        rmh_sigma=0.5,
+        target_ess=0.75,
         record_best=True,
     )
     

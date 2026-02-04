@@ -92,18 +92,22 @@ class ParticleSystem:
             score += jnp.sum((current - ideal)**2)
         return float(score)
     
-    def get_random_coords(self, rng_key: jnp.ndarray, box_size: Tuple[float, float, float]) -> Dict[str, jnp.ndarray]:
-        """Generate random coordinates with uniform prior inside a simulation box.
-        
-        Args:
-            rng_key: JAX PRNGKey
-            box_size: (x, y, z) dimensions of box in Angstrom
-        """
+    def get_random_coords(
+        self,
+        rng_key: jnp.ndarray,
+        box_size: Tuple[float, float, float],
+        center_at_origin: bool = True
+    ) -> Dict[str, jnp.ndarray]:
+        """Generate random coordinates with uniform prior inside a simulation box."""
         coords = {}
         for k in self.identity_order:
             rng_key, subkey = jax.random.split(rng_key)
             n = int(self.types[k]['copy'])
-            coords[k] = jax.random.uniform(subkey, (n, 3), minval=0.0, maxval=1.0) * jnp.array(box_size)
+            low, high = (-0.5, 0.5) if center_at_origin else (0.0, 1.0)
+            coords[k] = (
+                jax.random.uniform(subkey, (n, 3), minval=low, maxval=high)
+                * jnp.array(box_size)
+            )
         return coords
 
 def get_ideal_coords() -> Dict[str, jnp.ndarray]:

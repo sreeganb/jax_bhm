@@ -9,7 +9,7 @@ import mrcfile
 import time
 
 # comment the next line to use GPU/TPU if available
-#os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
@@ -24,11 +24,8 @@ from sampling.smc import run_tempered_smc, get_smc_samples, get_best_sample
 from io_utils.io_handlers import save_mcmc_to_hdf5
 from scoring.em_score import (
     create_em_config_from_mrcfile,
-    create_em_config_from_arrays,
-    calc_projection_jax,
-    calculate_ccc_score,
     create_em_log_prob_fn,
-    pairwise_correlation_jax,
+    calculate_ccc_jax,
 )
 
 
@@ -127,9 +124,7 @@ def main():
     
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
     
-    # Initialize particles centered at origin, within a smaller box
-    # to ensure they stay inside the ±500 box constraint after noise is added
-    init_box_size = 300.0  # Smaller initial box
+    init_box_size = 300.0
     coords = temp_system.get_random_coords(
         jax.random.PRNGKey(9090), box_size=[init_box_size, init_box_size, init_box_size]
     )
@@ -147,16 +142,13 @@ def main():
     # =========================================================================
     timer.start("4. Setup scoring functions")
 
-    # Slope for EM score to keep particles close to the map
     slope = 0.15
-    
-    # EM score: returns scale * CCC (log-probability, higher = better)
     em_scale = 100.0
     em_log_prob = create_em_log_prob_fn(em_config, flat_radii, scale=em_scale, slope=slope)
     radii_jax = jnp.array(flat_radii, dtype=jnp.float32)
     
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
-    nuisance_params = {'AA': 1.6, 'AB': 1.4, 'BC': 1.0}
+    nuisance_params = {'AA': 1.3, 'AB': 1.1, 'BC': 1.0}
     box_size = 300.0
     
     def log_prior_fn(flat_coords):
@@ -167,30 +159,25 @@ def main():
     
     @jax.jit
     def log_likelihood_fn(flat_coords):
-        """
-        Log likelihood = EM log-prob + pair/exvol log-prob
-        
-        Both terms return higher values for better configurations.
-        """
-        # EM term: scale * CCC (higher CCC = higher log-prob)
+        """Log likelihood = EM log-prob + pair/exvol log-prob."""
         em_log_prob_value = em_log_prob(flat_coords)
-        
-        # Pair + excluded volume term: -(ev_penalty + pair_nll)
-        # Already returns log-probability (negative of penalties)
         structure_log_prob = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
             exclusion_weight=1.0, pair_weight=1.0, exvol_sigma=0.10
         )
-        
         return em_log_prob_value + structure_log_prob
     
     def log_prob_fn(flat_coords):
         """Total log probability = log_prior + log_likelihood."""
         return log_prior_fn(flat_coords) + log_likelihood_fn(flat_coords)
     
-    # Function to get CCC without recomputing projection
-    get_ccc = jax.jit(lambda x: em_log_prob.with_ccc(x)[1])
+    # Function to get raw CCC (no slope penalty) using the new API
+    @jax.jit
+    def get_ccc(flat_coords):
+        """Get raw CCC without slope penalty."""
+        coords = flat_coords.reshape(-1, 3)
+        return calculate_ccc_jax(coords, radii_jax, em_config, slope=0.0)
     
     timer.stop("4. Setup scoring functions")
     
@@ -199,7 +186,6 @@ def main():
     # =========================================================================
     timer.start("5. JIT compilation (warmup)")
     
-    # Force JIT compilation by running once
     dummy_coords = system.flatten(coords)
     _ = log_prob_fn(dummy_coords)
     _ = get_ccc(dummy_coords)
@@ -217,11 +203,8 @@ def main():
     rng_key, init_key = jax.random.split(rng_key)
     
     flat_init = system.flatten(coords)
-    
-    # Smaller noise to keep particles valid
     initial_positions = flat_init + jax.random.normal(init_key, (n_particles, n_dims)) * 5.0
     
-    # Check how many particles are valid
     init_scores = jax.vmap(log_prob_fn)(initial_positions)
     valid_count = jnp.sum(jnp.isfinite(init_scores))
     jax.block_until_ready(init_scores)
@@ -229,7 +212,6 @@ def main():
     print(f"\nValid particles: {int(valid_count)}/{n_particles}")
     print(f"Initial Score (mean of valid): {jnp.nanmean(jnp.where(jnp.isfinite(init_scores), init_scores, jnp.nan)):.2f}")
     
-    # Debug: check coordinate ranges
     coords_3d = flat_init.reshape(-1, 3)
     print(f"Coord ranges: X[{float(coords_3d[:,0].min()):.1f}, {float(coords_3d[:,0].max()):.1f}], "
           f"Y[{float(coords_3d[:,1].min()):.1f}, {float(coords_3d[:,1].max()):.1f}], "
@@ -255,7 +237,6 @@ def main():
         record_best=True,
     )
     
-    # IMPORTANT: Block until SMC is complete before stopping timer
     jax.block_until_ready(final_state.particles)
     
     timer.stop("7. SMC sampling")
@@ -271,8 +252,12 @@ def main():
     final_scores = jax.vmap(log_prob_fn)(final_positions)
     jax.block_until_ready(final_scores)
     
+    # Compute CCC for the overall best particle
+    best_ccc = get_ccc(best_pos)
+    
     print(f"\nFinal Score (mean): {jnp.mean(final_scores):.2f}")
     print(f"Best Score: {best_score:.2f}")
+    print(f"Best CCC: {float(best_ccc):.4f}")
     
     # Print CCC for each step's best particle
     if best_positions is not None and best_scores is not None:
@@ -282,9 +267,12 @@ def main():
         print(f"{'Step':<8} {'Score':>12} {'CCC':>12}")
         print("-" * 60)
         
-        for step_idx, (pos, score) in enumerate(zip(best_positions, best_scores)):
-            ccc_value = get_ccc(jnp.array(pos))
-            print(f"{step_idx:<8} {score:>12.2f} {float(ccc_value):>12.4f}")
+        # Vectorized CCC computation for all best positions
+        best_cccs = jax.vmap(get_ccc)(jnp.array(best_positions))
+        jax.block_until_ready(best_cccs)
+        
+        for step_idx, (score, ccc) in enumerate(zip(best_scores, best_cccs)):
+            print(f"{step_idx:<8} {float(score):>12.2f} {float(ccc):>12.4f}")
         
         print("=" * 60)
     
@@ -303,7 +291,11 @@ def main():
             1.0,
             str(output_file),
             system,
-            params={'method': 'BlackJAX_SMC', 'trajectory': 'best_per_step'},
+            params={
+                'method': 'BlackJAX_SMC',
+                'trajectory': 'best_per_step',
+                'best_ccc': float(best_ccc),
+            },
             convert_to_rmf3=True,
             color_map={'A': (0.2, 0.6, 1.0), 'B': (0.9, 0.4, 0.2), 'C': (0.3, 0.8, 0.4)}
         )
@@ -311,9 +303,6 @@ def main():
     
     timer.stop("9. Save results")
     
-    # =========================================================================
-    # Print timing summary
-    # =========================================================================
     timer.summary()
 
 

@@ -12,10 +12,12 @@ import sys
 import os
 from pathlib import Path
 
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+#os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
+
+print("JAX default backend:", jax.default_backend())
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -63,9 +65,9 @@ def main():
     
     # Bounds for nuisance parameters (used for prior)
     nuisance_bounds = {
-        'AA': (0.1, 5.0),
-        'AB': (0.1, 5.0),
-        'BC': (0.1, 5.0),
+        'AA': (0.1, 4.0),
+        'AB': (0.1, 4.0),
+        'BC': (0.1, 4.0),
     }
     
     # Target distances
@@ -73,7 +75,7 @@ def main():
     
     # Prior hyperparameters for inverse gamma
     nuisance_prior_alpha = 3.0  # shape
-    nuisance_prior_beta = 1.0   # scale
+    nuisance_prior_beta = 0.5   # scale
     
     # Total dimensions = coords + nuisance
     n_total_dims = n_coord_dims + n_nuisance
@@ -125,7 +127,7 @@ def main():
             flat_coords, system, flat_radii,
             target_dists, nuisance_dict,
             exclusion_weight=1.0,
-            pair_weight=2.0,
+            pair_weight=4.0,
             exvol_sigma=0.1
         )
         
@@ -161,15 +163,15 @@ def main():
     
     rng_key, sample_key = jax.random.split(rng_key)
     
-    n_steps = 500000
+    n_steps = 100000
     # =========================================================================
     # 5. Run RMH Sampling with per-dimension sigma
     # =========================================================================
     
     # Create per-dimension sigma vector
     sigma_vec = jnp.concatenate([
-        jnp.ones(n_coord_dims) * 0.4,    # Coords: σ=0.4
-        jnp.ones(n_nuisance) * 0.05        # Nuisance: σ=0.05
+        jnp.ones(n_coord_dims) * 0.75,    # Coords: σ=0.4
+        jnp.ones(n_nuisance) * 0.01        # Nuisance: σ=0.05
     ])
     
     positions, log_probs, acceptance_rate = run_rmh_sampling(

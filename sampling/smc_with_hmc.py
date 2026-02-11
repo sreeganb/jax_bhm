@@ -7,12 +7,12 @@ Key differences from RMH version:
 - HMC state tracks logdensity_grad in addition to logdensity
 - Better exploration per step than RMH, but more expensive per step
 
-GPU/JIT notes:
-- All scoring functions must use jax.numpy (not numpy) for GPU compatibility
-- The SMC loop itself is Python-level (not jit-compiled) because the number
-  of tempering steps is unknown ahead of time. However, each step internally
-  is fully JIT-compiled by BlackJAX.
-- For GPU: remove JAX_PLATFORM_NAME="cpu" and ensure CUDA is available.
+GPU memory notes:
+- Uses batched_vmap for scoring to avoid OOM when evaluating many particles.
+  The EM density scoring with large maps (e.g. 160^3) uses significant
+  memory per particle, so vmapping all particles at once can exceed GPU RAM.
+- The SMC step itself (BlackJAX internals) also vmaps over particles.
+  If that OOMs, reduce n_particles or map resolution.
 """
 import jax
 import jax.numpy as jnp
@@ -22,6 +22,52 @@ import blackjax.smc.resampling as resampling
 from blackjax.smc import extend_params
 from typing import Callable, Tuple, List, Any, Optional
 import time
+
+
+# =============================================================================
+# Memory-safe batched vmap
+# =============================================================================
+
+def batched_vmap(fn: Callable, batch_size: int = 16):
+    """
+    Apply fn to an array of inputs in batches to control GPU memory.
+
+    Like jax.vmap(fn)(inputs) but processes batch_size inputs at a time,
+    so peak memory is O(batch_size) instead of O(n_total).
+
+    Each batch is JIT-compiled; results are concatenated at the end.
+    block_until_ready() is called between batches to free intermediates.
+
+    Parameters
+    ----------
+    fn : Callable
+        Scalar function: single input -> scalar output.
+    batch_size : int
+        Max inputs to process simultaneously. Tune to GPU memory.
+
+    Returns
+    -------
+    batched_fn : Callable
+        Takes (n, ...) array, returns (n,) results.
+    """
+    @jax.jit
+    def _score_batch(batch):
+        return jax.vmap(fn)(batch)
+
+    def batched_fn(inputs):
+        n = inputs.shape[0]
+        if n <= batch_size:
+            return _score_batch(inputs)
+
+        results = []
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch_result = _score_batch(inputs[start:end])
+            jax.block_until_ready(batch_result)
+            results.append(batch_result)
+        return jnp.concatenate(results, axis=0)
+
+    return batched_fn
 
 
 def run_tempered_smc(
@@ -39,12 +85,11 @@ def run_tempered_smc(
     target_ess: float = 0.5,
     record_best: bool = True,
     verbose: bool = True,
+    # GPU memory management
+    score_batch_size: int = 16,
 ) -> Tuple[Any, List, np.ndarray, np.ndarray]:
     """
     Run BlackJAX adaptive tempered SMC with HMC mutation kernel.
-
-    IMPORTANT: log_prior_fn and log_likelihood_fn must be JAX-differentiable.
-    Avoid hard boundaries (-inf); use soft penalties instead (see example script).
 
     Parameters
     ----------
@@ -57,32 +102,23 @@ def run_tempered_smc(
     initial_positions : jnp.ndarray
         Shape (n_particles, n_dims).
     rng_key : jax.Array
-        JAX PRNG key.
     n_mcmc_steps : int
-        Number of HMC mutation steps per SMC temperature step.
+        HMC mutations per SMC temperature step.
     hmc_step_size : float
-        Leapfrog integrator step size. Start small (0.001-0.01).
+        Leapfrog step size.
     hmc_inverse_mass_matrix : jnp.ndarray or None
-        Diagonal inverse mass matrix, shape (n_dims,). None = identity.
+        Diagonal inverse mass matrix (n_dims,). None = identity.
     hmc_num_integration_steps : int
-        Number of leapfrog steps per HMC proposal (L). Typical: 5-50.
+        Leapfrog steps per HMC proposal (L).
     target_ess : float
-        Target ESS ratio for adaptive tempering (0-1).
+        Target ESS ratio for adaptive tempering.
     record_best : bool
         Track best particle per step.
     verbose : bool
         Print progress.
-
-    Returns
-    -------
-    state : SMCState
-        Final SMC state with particles at lambda=1.
-    info_history : list
-        SMCInfo from each tempering step.
-    best_positions : np.ndarray or None
-        Shape (n_steps+1, n_dims) - best particle at each step.
-    best_scores : np.ndarray or None
-        Shape (n_steps+1,) - best score at each step.
+    score_batch_size : int
+        Particles scored simultaneously for tracking. Reduce if OOM
+        during scoring. Does NOT affect the SMC step internals.
     """
     n_particles, n_dims = initial_positions.shape
 
@@ -94,7 +130,6 @@ def run_tempered_smc(
     else:
         hmc_inverse_mass_matrix = jnp.asarray(hmc_inverse_mass_matrix)
 
-    # Ensure step size is a JAX scalar for tracing
     hmc_step_size = jnp.float32(hmc_step_size)
 
     # =========================================================================
@@ -102,8 +137,6 @@ def run_tempered_smc(
     # =========================================================================
     hmc_kernel = blackjax.hmc.build_kernel()
 
-    # Close over HMC parameters so the signature matches what SMC expects:
-    #   mcmc_step_fn(rng_key, state, logdensity_fn) -> (state, info)
     def mcmc_step_fn(rng_key, state, logdensity_fn):
         return hmc_kernel(
             rng_key,
@@ -131,17 +164,13 @@ def run_tempered_smc(
     )
 
     # =========================================================================
-    # 4. JIT-compile the step function
+    # 4. JIT-compile step + batched scoring
     # =========================================================================
-    # This is the key optimization: the step function is compiled once and
-    # reused for every tempering step. On GPU, this avoids repeated dispatch.
     jit_step = jax.jit(tempered_smc.step)
-
-    # Also JIT the scoring for best-particle tracking
-    jit_score_all = jax.jit(jax.vmap(log_prob_fn))
+    score_batched = batched_vmap(log_prob_fn, batch_size=score_batch_size)
 
     def get_best_stats(particles):
-        scores = jit_score_all(particles)
+        scores = score_batched(particles)
         idx = jnp.argmax(scores)
         return particles[idx], scores[idx], jnp.mean(scores), jnp.std(scores)
 
@@ -160,9 +189,10 @@ def run_tempered_smc(
               f"L={hmc_num_integration_steps}, "
               f"mass_matrix={'diagonal' if hmc_inverse_mass_matrix.ndim == 1 else 'dense'}")
         print(f"  MCMC steps/iter: {n_mcmc_steps}, Target ESS: {target_ess:.0%}")
+        print(f"  Score batch size: {score_batch_size}")
 
     # =========================================================================
-    # 6. Warmup: trigger JIT compilation before timing
+    # 6. Warmup JIT (compile before timing)
     # =========================================================================
     if verbose:
         print("  JIT compiling SMC step (first call)...")
@@ -174,7 +204,7 @@ def run_tempered_smc(
     if verbose:
         print("  JIT compilation done.")
 
-    # Reset state (don't use the warmup result)
+    # Reset state (don't use warmup result)
     state = tempered_smc.init(initial_positions)
 
     # =========================================================================
@@ -199,10 +229,7 @@ def run_tempered_smc(
     while state.tempering_param < 1.0:
         rng_key, step_key = jax.random.split(rng_key)
 
-        # JIT-compiled SMC step (resample + HMC mutations + adapt temperature)
         state, info = jit_step(step_key, state)
-
-        # Block for timing accuracy (no-op on CPU)
         jax.block_until_ready(state.particles)
 
         info_history.append(info)
@@ -215,7 +242,6 @@ def run_tempered_smc(
             best_scores.append(float(score))
 
         if verbose:
-            # Extract HMC acceptance rate from info if available
             acc_str = ""
             try:
                 update_info = info.update_info
@@ -236,7 +262,6 @@ def run_tempered_smc(
         print(f"\nSMC completed in {dt:.2f}s ({step_count} temperature steps)")
         print(f"  Average: {dt/max(step_count,1):.2f}s per step")
 
-    # Stack results
     if record_best and best_positions:
         best_positions = np.stack(best_positions, axis=0)
         best_scores = np.array(best_scores)
@@ -252,9 +277,9 @@ def get_smc_samples(state) -> jnp.ndarray:
     return state.particles
 
 
-def get_best_sample(state, log_prob_fn) -> Tuple[jnp.ndarray, float]:
-    """Identify the single best particle from the final population."""
+def get_best_sample(state, log_prob_fn, batch_size: int = 16) -> Tuple[jnp.ndarray, float]:
+    """Identify the single best particle (memory-safe)."""
     particles = state.particles
-    scores = jax.jit(jax.vmap(log_prob_fn))(particles)
+    scores = batched_vmap(log_prob_fn, batch_size=batch_size)(particles)
     best_idx = jnp.argmax(scores)
     return particles[best_idx], float(scores[best_idx])

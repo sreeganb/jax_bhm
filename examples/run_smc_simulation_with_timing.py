@@ -9,7 +9,7 @@ import mrcfile
 import time
 
 # comment the next line to use GPU/TPU if available
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+#os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax

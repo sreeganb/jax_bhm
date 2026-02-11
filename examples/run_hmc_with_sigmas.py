@@ -16,10 +16,12 @@ import sys
 import os
 from pathlib import Path
 
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+#os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
+
+print("JAX default backend:", jax.default_backend())
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

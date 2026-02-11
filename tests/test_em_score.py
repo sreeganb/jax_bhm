@@ -11,7 +11,7 @@ import numpy as np
 import mrcfile
 import os
 
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+#os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 from representation.particle_system import get_ideal_coords
 from scoring.em_score import create_em_config_from_mrcfile, calculate_ccc_score

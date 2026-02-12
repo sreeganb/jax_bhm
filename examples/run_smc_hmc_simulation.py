@@ -146,7 +146,7 @@ def main():
 
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
 
-    init_box_size = 300.0
+    init_box_size = 250.0
     coords = temp_system.get_random_coords(
         jax.random.PRNGKey(128907189),
         box_size=[init_box_size, init_box_size, init_box_size],
@@ -183,9 +183,9 @@ def main():
     #     lambda=0.005 -> log_prior ≈ -32     (moderate)
     #     lambda=0.01  -> log_prior ≈ -64     (strong)
 
-    sigma_ccc = 0.3
+    sigma_ccc = 0.2
     lambda_attract = 0.005
-    box_size = 300.0
+    box_size = 250.0
     box_steepness = 1.0
 
     print(f"\nProbabilistic model:")
@@ -216,7 +216,7 @@ def main():
         struct_term = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=1.0, pair_weight=0.0, exvol_sigma=0.10,
+            exclusion_weight=1.0, pair_weight=0.001, exvol_sigma=0.10,
         )
         return ccc_term + struct_term
 
@@ -298,9 +298,9 @@ def main():
     # =========================================================================
     # 7. HMC parameters
     # =========================================================================
-    hmc_step_size = 1.0
-    hmc_num_integration_steps = 20
-    n_mcmc_steps = 50
+    hmc_step_size = 2.0
+    hmc_num_integration_steps = 25
+    n_mcmc_steps = 80
 
     # =========================================================================
     # 8. Run SMC-HMC

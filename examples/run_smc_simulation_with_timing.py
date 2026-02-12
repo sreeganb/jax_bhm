@@ -135,7 +135,7 @@ def main():
 
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
 
-    init_box_size = 500.0
+    init_box_size = 250.0
     coords = temp_system.get_random_coords(
         jax.random.PRNGKey(128907189),
         box_size=[init_box_size, init_box_size, init_box_size],
@@ -168,8 +168,8 @@ def main():
     #     0.01  -> log_prior ~ -64   (strong)
 
     sigma_ccc = 0.3
-    lambda_attract = 0.005
-    box_size = 500.0
+    lambda_attract = 0.001
+    box_size = 250.0
     box_steepness = 1.0
 
     print(f"\nProbabilistic model:")
@@ -189,7 +189,7 @@ def main():
 
     # Structural restraints
     target_dists = {'AA': 48.2, 'AB': 38.5, 'BC': 34.0}
-    nuisance_params = {'AA': 1.3, 'AB': 1.1, 'BC': 1.0}
+    nuisance_params = {'AA': 1.5, 'AB': 1.3, 'BC': 1.0}
 
     # Combined likelihood = CCC Gaussian likelihood + structural restraints
     @jax.jit
@@ -199,7 +199,7 @@ def main():
         struct_term = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=1.0, pair_weight=2.0, exvol_sigma=0.10,
+            exclusion_weight=1.0, pair_weight=0.001, exvol_sigma=0.10,
         )
         return ccc_term + struct_term
 
@@ -241,7 +241,7 @@ def main():
     struct_val = log_probability(
         dummy_coords, system, flat_radii,
         target_dists, nuisance_params,
-        exclusion_weight=1.0, pair_weight=2.0, exvol_sigma=0.10,
+        exclusion_weight=1.0, pair_weight=0.001, exvol_sigma=0.10,
     )
 
     print(f"  log_prior:                 {float(prior_val):>12.4f}")
@@ -272,7 +272,7 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
 
-    n_particles = 200
+    n_particles = 10
     rng_key = jax.random.PRNGKey(90998210)
     rng_key, init_key = jax.random.split(rng_key)
 
@@ -322,9 +322,9 @@ def main():
     #   0.75 = conservative (smaller λ increments, more steps)
     #   0.9 = very conservative
 
-    n_mcmc_steps = 500
-    rmh_sigma = 2.0
-    target_ess = 0.5
+    n_mcmc_steps = 1000
+    rmh_sigma = 5.0
+    target_ess = 0.85
 
     print(f"\nSMC configuration:")
     print(f"  MCMC steps per temp:  {n_mcmc_steps}")

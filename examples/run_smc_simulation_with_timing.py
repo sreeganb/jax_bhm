@@ -167,7 +167,7 @@ def main():
     #     0.005 -> log_prior ~ -32   (moderate)
     #     0.01  -> log_prior ~ -64   (strong)
 
-    sigma_ccc = 0.3
+    sigma_ccc = 0.01
     lambda_attract = 0.001
     box_size = 250.0
     box_steepness = 1.0
@@ -199,7 +199,7 @@ def main():
         struct_term = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=1.0, pair_weight=0.001, exvol_sigma=0.10,
+            exclusion_weight=1.0, pair_weight=0.00001, exvol_sigma=0.10,
         )
         return ccc_term + struct_term
 
@@ -241,7 +241,7 @@ def main():
     struct_val = log_probability(
         dummy_coords, system, flat_radii,
         target_dists, nuisance_params,
-        exclusion_weight=1.0, pair_weight=0.001, exvol_sigma=0.10,
+        exclusion_weight=1.0, pair_weight=0.00001, exvol_sigma=0.10,
     )
 
     print(f"  log_prior:                 {float(prior_val):>12.4f}")
@@ -272,7 +272,7 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
 
-    n_particles = 10
+    n_particles = 40
     rng_key = jax.random.PRNGKey(90998210)
     rng_key, init_key = jax.random.split(rng_key)
 
@@ -322,9 +322,9 @@ def main():
     #   0.75 = conservative (smaller λ increments, more steps)
     #   0.9 = very conservative
 
-    n_mcmc_steps = 1000
-    rmh_sigma = 5.0
-    target_ess = 0.85
+    n_mcmc_steps = 50
+    rmh_sigma = 3.0
+    target_ess = 0.75
 
     print(f"\nSMC configuration:")
     print(f"  MCMC steps per temp:  {n_mcmc_steps}")

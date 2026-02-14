@@ -134,7 +134,18 @@ def calc_projection_jax(coords, weights, bins, resolution):
     img = jnp.swapaxes(histogram_flat.reshape((nx, ny, nz)), 0, 2)
 
     # Gaussian blur (separable, 3 passes)
-    sigma = resolution_to_sigma(resolution, voxel_size_x)
+    # MODIFICATION: Account for finite particle size
+    # 1. Calculate sigma purely based on map resolution
+    sigma_res = resolution_to_sigma(resolution, voxel_size_x)
+    
+    # 2. Estimate average particle radius from weights (since weights = r^3)
+    #    and convert to sigma units (radius / voxel_size)
+    mean_radius = jnp.mean(jnp.power(weights, 1.0/3.0))
+    sigma_particle = mean_radius / voxel_size_x
+    
+    # 3. Combine sigmas: sigma_total = sqrt(sigma_res^2 + sigma_particle^2)
+    sigma = jnp.sqrt(sigma_res**2 + sigma_particle**2)
+
     x = jnp.arange(-30, 31, dtype=jnp.float32)
     kernel_1d = jnp.exp(-0.5 * (x / sigma) ** 2) * (jnp.abs(x) <= 4.0 * sigma)
     kernel_1d = kernel_1d / jnp.sum(kernel_1d)

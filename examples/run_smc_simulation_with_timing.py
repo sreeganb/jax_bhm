@@ -241,7 +241,7 @@ def main():
     struct_val = log_probability(
         dummy_coords, system, flat_radii,
         target_dists, nuisance_params,
-        exclusion_weight=1.0, pair_weight=0.00075, exvol_sigma=0.10,
+        exclusion_weight=1.0, pair_weight=0.075, exvol_sigma=0.10,
     )
 
     print(f"  log_prior:                 {float(prior_val):>12.4f}")
@@ -272,7 +272,7 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
 
-    n_particles = 250
+    n_particles = 150
     rng_key = jax.random.PRNGKey(90998210)
     rng_key, init_key = jax.random.split(rng_key)
 
@@ -322,9 +322,9 @@ def main():
     #   0.75 = conservative (smaller λ increments, more steps)
     #   0.9 = very conservative
 
-    n_mcmc_steps = 100
-    rmh_sigma = 5.0
-    target_ess = 0.75
+    n_mcmc_steps = 25
+    rmh_sigma = 2.0
+    target_ess = 0.55
 
     print(f"\nSMC configuration:")
     print(f"  MCMC steps per temp:  {n_mcmc_steps}")

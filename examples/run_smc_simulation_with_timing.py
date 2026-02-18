@@ -23,8 +23,6 @@ import time
 import jax.numpy as jnp
 import jax
 
-print("JAX default backend:", jax.default_backend())
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from representation.particle_system import ParticleSystem, get_ideal_coords
@@ -90,7 +88,25 @@ class WallTimer:
         print("=" * 60)
 
 
-def main():
+def main(
+    n_particles=250,
+    n_mcmc_steps=40,
+    rmh_sigma=3.5,
+    target_ess=0.65,
+    pair_weight=0.000001,
+    sigma_ccc=0.005,
+    lambda_attract=0.1,
+    box_size=300.0,
+    output_dir="output",
+    output_filename="smc_trajectory.h5",
+    random_seed=90998210,
+):
+    """
+    Run SMC simulation with RMH kernel.
+
+    Returns a dict with keys: best_ccc, best_score, wall_time, n_smc_steps.
+    All parameters have defaults matching the original hardcoded values.
+    """
     timer = WallTimer()
 
     print("=" * 60)
@@ -98,8 +114,8 @@ def main():
     print(f"Backend: {jax.default_backend()}")
     print("=" * 60)
 
-    output_dir = Path("output")
-    output_dir.mkdir(exist_ok=True)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # =========================================================================
     # 1. Setup system
@@ -175,9 +191,6 @@ def main():
     #     0.005 -> log_prior ~ -32   (moderate)
     #     0.01  -> log_prior ~ -64   (strong)
 
-    sigma_ccc = 0.005
-    lambda_attract = 0.1
-    box_size = 300.0
     box_steepness = 1.0
 
     print(f"\nProbabilistic model:")
@@ -207,7 +220,7 @@ def main():
         struct_term = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=1.0, pair_weight=0.000001, exvol_sigma=0.10,
+            exclusion_weight=1.0, pair_weight=pair_weight, exvol_sigma=0.10,
         )
         return ccc_term + struct_term
 
@@ -249,7 +262,7 @@ def main():
     struct_val = log_probability(
         dummy_coords, system, flat_radii,
         target_dists, nuisance_params,
-        exclusion_weight=1.0, pair_weight=0.000001, exvol_sigma=0.10,
+        exclusion_weight=1.0, pair_weight=pair_weight, exvol_sigma=0.10,
     )
 
     print(f"  log_prior:                 {float(prior_val):>12.4f}")
@@ -280,8 +293,7 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
 
-    n_particles = 250
-    rng_key = jax.random.PRNGKey(90998210)
+    rng_key = jax.random.PRNGKey(random_seed)
     rng_key, init_key = jax.random.split(rng_key)
 
     flat_init = system.flatten(coords)
@@ -329,10 +341,6 @@ def main():
     #   0.5 = default (moderate steps)
     #   0.75 = conservative (smaller λ increments, more steps)
     #   0.9 = very conservative
-
-    n_mcmc_steps = 40
-    rmh_sigma = 3.5
-    target_ess = 0.65
 
     print(f"\nSMC configuration:")
     print(f"  MCMC steps per temp:  {n_mcmc_steps}")
@@ -427,7 +435,7 @@ def main():
     timer.start("9. Save results")
 
     if best_positions is not None and best_scores is not None:
-        output_file = output_dir / "smc_trajectory.h5"
+        output_file = output_dir / output_filename
         save_mcmc_to_hdf5(
             np.array(best_positions),
             np.array(best_scores),
@@ -439,6 +447,7 @@ def main():
                 'model': 'Gaussian_CCC + Exp_Distance + Structural',
                 'sigma_ccc': sigma_ccc,
                 'lambda_attract': lambda_attract,
+                'pair_weight': pair_weight,
                 'n_mcmc_steps': n_mcmc_steps,
                 'rmh_sigma': rmh_sigma,
                 'target_ess': target_ess,
@@ -460,6 +469,20 @@ def main():
 
     timer.summary()
 
+    return {
+        'best_ccc': float(best_ccc),
+        'best_score': float(best_score),
+        'wall_time': timer.total(),
+        'n_particles': n_particles,
+        'n_mcmc_steps': n_mcmc_steps,
+        'rmh_sigma': rmh_sigma,
+        'target_ess': target_ess,
+        'pair_weight': pair_weight,
+        'sigma_ccc': sigma_ccc,
+        'lambda_attract': lambda_attract,
+    }
+
 
 if __name__ == "__main__":
+    print("JAX default backend:", jax.default_backend())
     main()

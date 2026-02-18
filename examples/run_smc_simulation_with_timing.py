@@ -18,7 +18,7 @@ import mrcfile
 import time
 
 # comment the next line to use GPU/TPU if available
-# os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax.numpy as jnp
 import jax
@@ -89,7 +89,7 @@ class WallTimer:
 
 
 def main(
-    n_particles=250,
+    n_particles=20,
     n_mcmc_steps=40,
     rmh_sigma=3.5,
     target_ess=0.65,
@@ -159,10 +159,16 @@ def main(
 
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
 
-    # Initialize all coordinates to 0.0
-    n_total_particles = sum(cfg['copy'] for cfg in types_config.values())
-    coords = {ptype: jnp.zeros((types_config[ptype]['copy'], 3)) 
-              for ptype in types_config.keys()}
+    # Initialize all particles close together with small random perturbations
+    rng_key_init = jax.random.PRNGKey(12345)  # separate key for initialization
+    spread = 5.0  # controls how close particles are (in Angstroms)
+    
+    coords = {}
+    for ptype in types_config.keys():
+        n_copies = types_config[ptype]['copy']
+        # Small random offsets around origin
+        coords[ptype] = jax.random.normal(rng_key_init, (n_copies, 3)) * spread
+        rng_key_init = jax.random.split(rng_key_init)[0]
 
     system = ParticleSystem(types_config, coords, ideal_coords)
     flat_radii = system.get_flat_radii()
@@ -170,7 +176,7 @@ def main(
     n_dims = system.total_particles * 3
 
     print(f"\nSystem: {system.total_particles} particles, {n_dims} dimensions")
-    print("All particles initialized at origin (0, 0, 0)")
+    print(f"All particles initialized close together (spread ~ {spread} Å)")
 
     timer.stop("3. Initialize coordinates")
     # =========================================================================

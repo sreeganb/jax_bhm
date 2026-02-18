@@ -159,11 +159,10 @@ def main(
 
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
 
-    init_box_size = 300.0
-    coords = temp_system.get_random_coords(
-        jax.random.PRNGKey(12897189),
-        box_size=[init_box_size, init_box_size, init_box_size],
-    )
+    # Initialize all coordinates to 0.0
+    n_total_particles = sum(cfg['copy'] for cfg in types_config.values())
+    coords = {ptype: jnp.zeros((types_config[ptype]['copy'], 3)) 
+              for ptype in types_config.keys()}
 
     system = ParticleSystem(types_config, coords, ideal_coords)
     flat_radii = system.get_flat_radii()
@@ -171,9 +170,9 @@ def main(
     n_dims = system.total_particles * 3
 
     print(f"\nSystem: {system.total_particles} particles, {n_dims} dimensions")
+    print("All particles initialized at origin (0, 0, 0)")
 
     timer.stop("3. Initialize coordinates")
-
     # =========================================================================
     # 4. Build probabilistic model
     # =========================================================================

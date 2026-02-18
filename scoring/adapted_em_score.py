@@ -81,7 +81,9 @@ _NORM_EPS = 1e-8
 # Core density projection (adapted from accc_jax.py)
 # =====================================================================
 
-_SIGMA_FACTOR = 4.0 * math.sqrt(2.0 * math.log(2.0))
+#_SIGMA_FACTOR = 4.0 * math.sqrt(2.0 * math.log(2.0))
+# To follow what is done in chimerax molmap
+_SIGMA_FACTOR = 2.0 * math.sqrt(2.0 * math.log(2.0))
 
 
 def resolution_to_sigma(resolution, pixel_size):
@@ -374,7 +376,8 @@ def generate_density_map(
     bins = (bins_1d, bins_1d, bins_1d)
 
     coords_jax = jnp.array(coords, dtype=jnp.float32)
-    weights = jnp.array(radii, dtype=jnp.float32) ** 3
+    #weights = jnp.array(radii, dtype=jnp.float32) ** 3
+    weights = jnp.array(radii, dtype=jnp.float32) ** 0.0  # uniform weights for testing
 
     density = calc_projection_jax(coords_jax, weights, bins, float(resolution))
 

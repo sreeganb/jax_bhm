@@ -12,6 +12,12 @@ from .smc import (
     get_smc_samples,
     get_best_sample,
 )
+from .rigid_body_proposal import (
+    create_rigid_body_rmh_kernel,
+    create_rigid_body_smc_step_fn,
+    run_rigid_body_rmh,
+    run_rigid_body_smc,
+)
 
 __all__ = [
     'create_rmh_kernel',
@@ -21,4 +27,8 @@ __all__ = [
     'run_tempered_smc',
     'get_smc_samples',
     'get_best_sample',
+    'create_rigid_body_rmh_kernel',
+    'create_rigid_body_smc_step_fn',
+    'run_rigid_body_rmh',
+    'run_rigid_body_smc',
 ]

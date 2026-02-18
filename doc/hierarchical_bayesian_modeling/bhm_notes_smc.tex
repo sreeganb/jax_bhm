@@ -277,6 +277,39 @@ The EM likelihood is fundamentally different from distance likelihoods---it meas
 A large $\sigma_{\text{EM}}$ may indicate that the EM map represents a highly heterogeneous population, not that the data is ``bad.''
 \end{remark}
 
+\subsection{Level 4: Affinity Purification Mass Spectrometry (AP-MS)}
+\label{sec:apms_data}
+
+Affinity purification mass spectrometry (AP-MS) provides \textit{binary interaction data}: it identifies which protein types physically associate, without providing distances or stoichiometry. Unlike the distance-based likelihoods of Levels 1--3, AP-MS constrains the \textit{topology} of the assembly.
+
+\textbf{Data:} A set of observed interaction pairs:
+\begin{equation}
+    \mathcal{I}_{\text{apms}} = \{(t_a, t_b) : \text{types } t_a \text{ and } t_b \text{ co-purify}\}
+\end{equation}
+
+For our model system: $\mathcal{I}_{\text{apms}} = \{(A, B),\, (B, C)\}$, indicating that A interacts with B and B interacts with C (but, notably, A does not directly interact with C).
+
+\textbf{Model:} For each observed interaction $(t_a, t_b) \in \mathcal{I}_{\text{apms}}$, every particle of type $t_a$ should have at least one particle of type $t_b$ within a characteristic contact distance $d_c$. We measure satisfaction by the minimum pairwise distance:
+\begin{equation}
+    \delta_i^{(t_a, t_b)} = \min_{j \,:\, t_j = t_b} \|\bx_i - \bx_j\|, \quad \text{for each } i \text{ with } t_i = t_a
+\end{equation}
+
+\textbf{Log-likelihood:} A Gaussian penalty centred at the contact distance:
+\begin{equation}
+    \log p(\mathcal{D}_{\text{apms}} \mid \bX, \sigma_{\text{apms}}) = -\frac{1}{2\sigma_{\text{apms}}^2} \sum_{(t_a, t_b) \in \mathcal{I}_{\text{apms}}} \sum_{i \,:\, t_i = t_a} \left(\delta_i^{(t_a, t_b)} - d_c\right)^2
+    \label{eq:apms_lik}
+\end{equation}
+where $d_c \approx r_{t_a} + r_{t_b}$ is the expected contact distance (sum of particle radii). The nuisance parameter $\sigma_{\text{apms}}$ captures uncertainty about the precise contact geometry.
+
+\begin{remark}[AP-MS as Topological Constraint]
+AP-MS differs fundamentally from the distance data in Levels 1--3 in two respects:
+\begin{enumerate}
+    \item It provides no metric information---only the binary statement ``type $t_a$ touches type $t_b$.'' The contact distance $d_c$ is derived from geometric modelling (sum of radii), not measured.
+    \item It uses a \textbf{min} over partners rather than a sum over all pairs. Each particle of type $t_a$ need satisfy only one contact with type $t_b$---exactly matching the biological reality that each A binds one B, not all B's.
+\end{enumerate}
+This makes AP-MS data both weaker (no precise distances) and more robust (less sensitive to conformational flexibility) than XL-MS. As we will see in Section~\ref{sec:mst}, the same interaction set $\mathcal{I}_{\text{apms}}$ plays a dual role: it defines the likelihood above \textit{and} determines the edge set of the interaction graph used for rigid body identification.
+\end{remark}
+
 % ===========================================================================
 \section{Hierarchical Prior Structure}
 % ===========================================================================
@@ -285,7 +318,7 @@ The key insight of Bayesian hierarchical modeling is that nuisance parameters at
 
 \subsection{Why Connect Unrelated Experiments?}
 
-At first glance, connecting $\sigma_{\text{tet}}$, $\sigma_{\text{xl}}$, and $\sigma_{\text{EM}}$ seems strange---they come from completely different experiments!
+At first glance, connecting $\sigma_{\text{tet}}$, $\sigma_{\text{xl}}$, $\sigma_{\text{EM}}$, and $\sigma_{\text{apms}}$ seems strange---they come from completely different experiments!
 
 However, there are principled reasons to connect them:
 
@@ -420,10 +453,16 @@ Each nuisance parameter has a prior that depends on $\tau$, with level-specific 
     \sigma_{\text{EM}} \sim \HalfCauchy(\kappa_{\text{EM}} \cdot \tau)
 \end{equation}
 
-The scaling factors $\kappa_{\text{xl}}$ and $\kappa_{\text{EM}}$ encode our prior belief about relative precision:
+\textbf{AP-MS contact precision:}
+\begin{equation}
+    \sigma_{\text{apms}} \sim \HalfCauchy(\kappa_{\text{apms}} \cdot \tau)
+\end{equation}
+
+The scaling factors $\kappa$ encode our prior belief about relative precision:
 \begin{itemize}
     \item $\kappa_{\text{xl}} = 3$: XL-MS is expected to be $\sim 3\times$ less precise than tetramer data
     \item $\kappa_{\text{EM}} = 5$: EM fit quality is more uncertain
+    \item $\kappa_{\text{apms}} = 2$: AP-MS contacts are geometrically well-defined (sum of radii) but the ``contact'' criterion is soft
 \end{itemize}
 
 \begin{remark}[Decomposing Uncertainty]
@@ -452,6 +491,156 @@ Additional priors can encode:
 \end{itemize}
 
 % ===========================================================================
+\section{AP-MS--Driven Rigid Body Structure via Minimum Spanning Trees}
+\label{sec:mst}
+% ===========================================================================
+
+The AP-MS interaction data contributes not only a likelihood term (Section~\ref{sec:apms_data}) but also reveals the \textit{modular architecture} of the assembly. Combined with the current spatial configuration $\bX$, AP-MS enables dynamic identification of rigid body units at each sampling step via a Minimum Spanning Tree (MST) algorithm. This section formalises the MST partition and its role in the hierarchical framework.
+
+\subsection{The Interaction Graph}
+
+\begin{definition}[AP-MS Interaction Graph]
+Given particle positions $\bX \in \R^{3N}$ and the AP-MS interaction set $\mathcal{I}_{\text{apms}}$, we define the weighted interaction graph $G(\bX) = (V, E, w)$:
+\begin{itemize}
+    \item $V = \{1, \ldots, N\}$ \hfill (all particles)
+    \item $E = \{(i, j) : (t_i, t_j) \in \mathcal{I}_{\text{apms}},\; i < j\}$ \hfill (edges between interacting types)
+    \item $w_{ij} = \|\bx_i - \bx_j\|$ \hfill (Euclidean distance as edge weight)
+\end{itemize}
+\end{definition}
+
+Crucially, edges exist \textit{only} between particles whose types are known to interact. For $\mathcal{I}_{\text{apms}} = \{(A,B), (B,C)\}$, the graph contains A--B and B--C edges but \textbf{no} A--A, B--B, C--C, or A--C edges. The graph therefore encodes the AP-MS topology weighted by current spatial proximity.
+
+\subsection{Minimum Spanning Tree and Edge Cutting}
+
+\begin{definition}[MST Partition]
+The \textbf{MST partition} $\Pi_K(\bX)$ of $N$ particles into $K$ rigid bodies is computed as:
+\begin{enumerate}
+    \item Compute the minimum spanning tree $T(\bX)$ of $G(\bX)$, yielding $N - 1$ edges.
+    \item Sort the MST edges by weight in descending order: $w_{e_1} \geq w_{e_2} \geq \cdots \geq w_{e_{N-1}}$.
+    \item Remove the $K - 1$ longest edges $\{e_1, \ldots, e_{K-1}\}$.
+    \item The remaining forest has exactly $K$ connected components $\mathcal{B}_1, \ldots, \mathcal{B}_K$.
+\end{enumerate}
+\end{definition}
+
+\textbf{Intuition.} The MST connects all $N$ particles using the cheapest (shortest-distance) edges that respect the AP-MS topology. Within a tetramer (e.g., an ABCC unit), inter-particle distances are small ($\lesssim 40$~\AA), producing short, cheap MST edges. Between tetramers, the shortest AP-MS-compatible path must traverse much larger distances ($\gtrsim 100$~\AA). Cutting the $K - 1$ longest MST edges therefore severs precisely the inter-tetramer connections, leaving $K$ intra-tetramer clusters.
+
+\begin{center}
+\begin{tikzpicture}[
+    scale=0.85,
+    particle/.style={circle, draw, minimum size=0.6cm, font=\small},
+    A/.style={particle, fill=blue!20},
+    B/.style={particle, fill=orange!20},
+    C/.style={particle, fill=green!20},
+    mst edge/.style={thick, black},
+    cut edge/.style={thick, red, dashed},
+]
+% Tetramer 1 (left cluster)
+\node[A] (a1) at (0, 1.5) {A};
+\node[B] (b1) at (1.2, 0.5) {B};
+\node[C] (c1a) at (2.2, 1.5) {C};
+\node[C] (c1b) at (2.2, -0.5) {C};
+
+% Tetramer 2 (right cluster)
+\node[A] (a2) at (7, 1.5) {A};
+\node[B] (b2) at (5.8, 0.5) {B};
+\node[C] (c2a) at (4.8, 1.5) {C};
+\node[C] (c2b) at (4.8, -0.5) {C};
+
+% Intra-tetramer MST edges (short, kept)
+\draw[mst edge] (a1) -- node[above, font=\tiny] {38\AA} (b1);
+\draw[mst edge] (b1) -- node[above, font=\tiny] {30\AA} (c1a);
+\draw[mst edge] (b1) -- node[below, font=\tiny] {30\AA} (c1b);
+\draw[mst edge] (a2) -- node[above, font=\tiny] {38\AA} (b2);
+\draw[mst edge] (b2) -- node[above, font=\tiny] {30\AA} (c2a);
+\draw[mst edge] (b2) -- node[below, font=\tiny] {30\AA} (c2b);
+
+% Inter-tetramer MST edge (long, cut)
+\draw[cut edge] (c1a) -- node[above, font=\tiny\color{red}] {180\AA} (c2a);
+
+% Legend
+\node[below, font=\small] at (3.5, -1.3) {
+    \tikz{\draw[mst edge] (0,0) -- (0.6,0);} Kept (intra-body) \quad
+    \tikz{\draw[cut edge] (0,0) -- (0.6,0);} Cut (inter-body)
+};
+
+% Body labels
+\node[font=\small\bfseries] at (1.1, -1.7) {$\mathcal{B}_1$};
+\node[font=\small\bfseries] at (5.9, -1.7) {$\mathcal{B}_2$};
+\end{tikzpicture}
+\end{center}
+
+For our system ($N = 32$, $K = 8$), the MST has 31 edges; cutting the 7 longest yields 8 connected components---ideally the 8 ABCC tetramers.
+
+\subsection{Rigid Body Parameterisation}
+
+Each rigid body $\mathcal{B}_k$ is parameterised by 6 degrees of freedom (DOF):
+
+\begin{definition}[Rigid Body Coordinates]
+For rigid body $\mathcal{B}_k = \{i_1, \ldots, i_{n_k}\}$ with centre of mass
+\begin{equation}
+    \bar{\bx}_k = \frac{1}{n_k} \sum_{i \in \mathcal{B}_k} \bx_i\,,
+\end{equation}
+define:
+\begin{itemize}
+    \item \textbf{Reference coordinates:} $\mathbf{r}_i^{(k)} = \bx_i - \bar{\bx}_k$, for each $i \in \mathcal{B}_k$.
+    \item \textbf{Translation:} $\mathbf{t}_k \in \R^3$.
+    \item \textbf{Rotation:} $R_k \in \mathrm{SO}(3)$, parameterised by axis-angle $(\hat{\mathbf{n}}_k, \theta_k)$ via Rodrigues' formula:
+\end{itemize}
+\begin{equation}
+    R_k = I + \sin\theta_k\, [\hat{\mathbf{n}}_k]_\times + (1 - \cos\theta_k)\, [\hat{\mathbf{n}}_k]_\times^2
+\end{equation}
+where $[\hat{\mathbf{n}}]_\times$ denotes the $3 \times 3$ skew-symmetric matrix of $\hat{\mathbf{n}}$.
+\end{definition}
+
+A rigid body move updates the positions of all particles in $\mathcal{B}_k$ simultaneously:
+\begin{equation}
+    \bx_i' = R_k \cdot \mathbf{r}_i^{(k)} + \bar{\bx}_k + \mathbf{t}_k, \quad \forall\, i \in \mathcal{B}_k
+    \label{eq:rigid_transform}
+\end{equation}
+
+This reduces the effective dimensionality from $3 n_k$ (individual particle positions) to $6$ (rigid body DOF). For $K = 8$ tetramers of $n_k = 4$ particles each, the rigid body representation uses $8 \times 6 = 48$ DOF instead of $32 \times 3 = 96$.
+
+\subsection{Dynamic Grouping: Why Recompute at Each Step?}
+
+The partition $\Pi_K(\bX)$ depends on the current configuration $\bX$ and is recomputed at every MCMC step. This is essential because the quality of the grouping evolves with the sampling:
+
+\begin{enumerate}
+    \item \textbf{Early in sampling} (random initialisation): Particles are dispersed. The MST connects arbitrary particles, yielding incorrect bodies (e.g., A$_2$B$_5$C$_7$). This is harmless---proposals on wrong bodies are simply rejected by Metropolis--Hastings.
+    
+    \item \textbf{As sampling progresses:} Particles coalesce into physical units. The MST begins to correctly identify tetramers (A$_1$B$_1$C$_2$). Rigid body proposals now make large, physically meaningful moves that would require thousands of single-particle steps.
+    
+    \item \textbf{At equilibrium:} Bodies are well-formed. Rigid moves efficiently explore the relative positions and orientations of intact tetramers, the slow degrees of freedom of the system.
+\end{enumerate}
+
+\begin{remark}[Detailed Balance]
+Because $\Pi_K(\bX)$ is state-dependent, the forward and reverse proposal densities are not exactly symmetric. This introduces a small bias in the Markov chain. However, state-dependent proposals are standard practice in structural biology (IMP, HADDOCK, Rosetta) and the bias is negligible for moderate system sizes. The approach can in principle be made exact by including the Jacobian of the grouping transformation in the acceptance ratio, but this is unnecessary in practice for the system sizes considered here.
+\end{remark}
+
+\subsection{Integration with the Hierarchical Model}
+
+The MST-based rigid body decomposition connects to the Bayesian hierarchical framework at two distinct levels:
+
+\textbf{1.\ Scoring level (likelihood / prior):}
+The AP-MS data $\mathcal{I}_{\text{apms}}$ defines both the contact likelihood (Eq.~\ref{eq:apms_lik}) and the edge set of the interaction graph $G(\bX)$. These two uses are consistent: the same physical interactions that produce co-purification in AP-MS also define which particles should be grouped into rigid bodies.
+
+\textbf{2.\ Sampling level (proposal mechanism):}
+The rigid body partition $\Pi_K(\bX)$ defines a structured proposal distribution for the MCMC mutation kernel within SMC. This does not change the target posterior---only the efficiency with which we explore it. The mixed-move kernel is described in Section~\ref{sec:smc_mixed}.
+
+The full pipeline from data to proposal is:
+\begin{equation}
+    \underbrace{\mathcal{I}_{\text{apms}}}_{\text{AP-MS data}} \;\longrightarrow\;
+    \underbrace{G(\bX)}_{\text{Interaction graph}} \;\longrightarrow\;
+    \underbrace{T(\bX)}_{\text{MST}} \;\longrightarrow\;
+    \underbrace{\Pi_K(\bX)}_{\text{Rigid bodies}} \;\longrightarrow\;
+    \underbrace{q_{\text{rigid}}(\bX' \mid \bX)}_{\text{Proposal}}
+    \label{eq:mst_pipeline}
+\end{equation}
+
+\begin{remark}[Graph-Theoretic Interpretation]
+The MST partition can be viewed as a fast, deterministic approximation to spectral clustering on a distance-weighted graph constrained by the AP-MS topology.  The minimum spanning tree selects the optimal tree-structured subgraph, and the $K-1$ longest-edge cut is equivalent to the $(K-1)$-th most expensive edge removal in a single-linkage agglomerative clustering.  This is exact for tree-metric data and provides a good heuristic for Euclidean distances in $\R^3$.
+\end{remark}
+
+% ===========================================================================
 \section{The Full Posterior}
 % ===========================================================================
 
@@ -461,15 +650,17 @@ The full posterior over all unknowns is:
 \begin{equation}
 \boxed{
 \begin{aligned}
-    p(\bX, \sigma_{\text{tet}}, \sigma_{\text{xl}}, \sigma_{\text{EM}}, \tau \mid \mathcal{D}) 
-    &\propto 
+    &p(\bX, \sigma_{\text{tet}}, \sigma_{\text{xl}}, \sigma_{\text{EM}}, \sigma_{\text{apms}}, \tau \mid \mathcal{D}) \\ 
+    &\quad\propto 
     \underbrace{p(\mathcal{D}_{\text{tet}} \mid \bX, \sigma_{\text{tet}})}_{\text{Tetramer likelihood}}
     \cdot \underbrace{p(\mathcal{D}_{\text{xl}} \mid \bX, \sigma_{\text{xl}})}_{\text{XL-MS likelihood}}
-    \cdot \underbrace{p(\mathcal{D}_{\text{EM}} \mid \bX, \sigma_{\text{EM}})}_{\text{EM likelihood}} \\
-    &\quad \times 
+    \cdot \underbrace{p(\mathcal{D}_{\text{EM}} \mid \bX, \sigma_{\text{EM}})}_{\text{EM likelihood}}
+    \cdot \underbrace{p(\mathcal{D}_{\text{apms}} \mid \bX, \sigma_{\text{apms}})}_{\text{AP-MS likelihood}} \\
+    &\quad\times 
     \underbrace{p(\sigma_{\text{tet}} \mid \tau)}_{\text{Prior}}
     \cdot \underbrace{p(\sigma_{\text{xl}} \mid \tau)}_{\text{Prior}}
     \cdot \underbrace{p(\sigma_{\text{EM}} \mid \tau)}_{\text{Prior}}
+    \cdot \underbrace{p(\sigma_{\text{apms}} \mid \tau)}_{\text{Prior}}
     \cdot \underbrace{p(\tau)}_{\text{Hyperprior}}
     \cdot \underbrace{p(\bX)}_{\text{Coord prior}}
 \end{aligned}
@@ -485,12 +676,13 @@ For numerical computation, we work with the log-posterior:
     \underbrace{-\frac{1}{2\sigma_{\text{tet}}^2} \sum_{\text{tet pairs}} (d_{ij}^{\text{tet}} - \|\bx_i - \bx_j\|)^2}_{\text{Tetramer log-lik}} \\
     &\quad + \underbrace{-\frac{1}{2\sigma_{\text{xl}}^2} \sum_{\text{XL pairs}} (d_{ij}^{\text{xl}} - \|\bx_i - \bx_j\|)^2}_{\text{XL-MS log-lik}} \\
     &\quad + \underbrace{\frac{\text{CCC}(\bX)}{\sigma_{\text{EM}}^2}}_{\text{EM log-lik}} \\
-    &\quad + \underbrace{\log p(\sigma_{\text{tet}} \mid \tau) + \log p(\sigma_{\text{xl}} \mid \tau) + \log p(\sigma_{\text{EM}} \mid \tau)}_{\text{Priors on } \sigma} \\
+    &\quad + \underbrace{-\frac{1}{2\sigma_{\text{apms}}^2} \sum_{(t_a, t_b) \in \mathcal{I}} \sum_{i:\, t_i = t_a} \!\left(\min_{j:\, t_j = t_b} \|\bx_i - \bx_j\| - d_c\right)^{\!2}}_{\text{AP-MS log-lik}} \\
+    &\quad + \underbrace{\log p(\sigma_{\text{tet}} \mid \tau) + \log p(\sigma_{\text{xl}} \mid \tau) + \log p(\sigma_{\text{EM}} \mid \tau) + \log p(\sigma_{\text{apms}} \mid \tau)}_{\text{Priors on } \sigma} \\
     &\quad + \underbrace{\log p(\tau)}_{\text{Hyperprior}} + \underbrace{\log p(\bX)}_{\text{Coord prior}} + \text{const}
 \end{aligned}
 \end{equation}
 
-where $\btheta = (\bX, \sigma_{\text{tet}}, \sigma_{\text{xl}}, \sigma_{\text{EM}}, \tau)$ is the full parameter vector.
+where $\btheta = (\bX, \sigma_{\text{tet}}, \sigma_{\text{xl}}, \sigma_{\text{EM}}, \sigma_{\text{apms}}, \tau)$ is the full parameter vector.
 
 % ===========================================================================
 \section{Sequential Monte Carlo Sampling}
@@ -500,7 +692,7 @@ where $\btheta = (\bX, \sigma_{\text{tet}}, \sigma_{\text{xl}}, \sigma_{\text{EM
 
 The posterior is:
 \begin{itemize}
-    \item \textbf{High-dimensional}: $3N + 4$ parameters (e.g., $3 \times 32 + 4 = 100$)
+    \item \textbf{High-dimensional}: $3N + 5$ parameters (e.g., $3 \times 32 + 5 = 101$)
     \item \textbf{Multi-modal}: Multiple valid structural configurations
     \item \textbf{Rugged}: Excluded volume creates hard constraints
 \end{itemize}
@@ -548,16 +740,72 @@ Within each SMC step, we use Random Walk Metropolis-Hastings (RMH) with \textbf{
 \toprule
 \textbf{Parameter} & \textbf{Dimension} & \textbf{Proposal $\sigma$} \\
 \midrule
-Coordinates $\bX$ & $3N$ & 2.0 \AA \\
+Coordinates $\bX$ (single-particle) & $3N$ & 2.0 \AA \\
+Rigid body translation $\mathbf{t}_k$ & 3 & 2.0 \AA \\
+Rigid body rotation $\theta_k$ & 1 & 0.05 rad ($\approx 3^\circ$) \\
 $\sigma_{\text{tet}}$ & 1 & 0.1 \AA \\
 $\sigma_{\text{xl}}$ & 1 & 0.5 \AA \\
 $\sigma_{\text{EM}}$ & 1 & 0.2 \\
+$\sigma_{\text{apms}}$ & 1 & 0.3 \\
 $\tau$ & 1 & 0.3 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 This ensures efficient exploration of both coordinate space and nuisance parameter space.
+
+\subsection{Mixed-Move MCMC Kernel with Rigid Body Proposals}
+\label{sec:smc_mixed}
+
+Standard single-particle RMH scales poorly for collective motions---moving an entire tetramer to a new position requires $\mathcal{O}(n_k)$ coordinated accepted single-particle steps, each of which has low probability. The MST-based rigid body decomposition (Section~\ref{sec:mst}) enables a \textbf{mixed-move} MCMC kernel that alternates between fine-grained and coarse-grained proposals.
+
+At each MCMC mutation step (within a single SMC temperature), a move type is selected stochastically:
+
+\begin{equation}
+    \text{move type} = \begin{cases}
+        \text{single-particle perturbation} & \text{with probability } p_{\text{single}} \\
+        \text{rigid body move} & \text{with probability } p_{\text{rigid}} \\
+        \text{global perturbation} & \text{with probability } 1 - p_{\text{single}} - p_{\text{rigid}}
+    \end{cases}
+\end{equation}
+
+\textbf{Single-particle perturbation.} Additive Gaussian noise on all coordinates: $\bX' = \bX + \boldsymbol{\epsilon}$, $\boldsymbol{\epsilon} \sim \Normal(\mathbf{0}, \sigma_{\text{single}}^2 I)$. Provides fine-grained local refinement.
+
+\textbf{Rigid body move.}
+\begin{enumerate}
+    \item Compute the MST partition $\Pi_K(\bX)$ from current positions.
+    \item Select a rigid body $\mathcal{B}_k$ uniformly at random.
+    \item Sample translation $\mathbf{t}_k \sim \Normal(\mathbf{0}, \sigma_{\text{trans}}^2 I)$ and rotation angle $\theta_k \sim \Normal(0, \sigma_{\text{rot}}^2)$ about a uniformly random axis $\hat{\mathbf{n}}_k \sim \text{Uniform}(S^2)$.
+    \item Apply the rigid transform (Eq.~\ref{eq:rigid_transform}) to all particles in $\mathcal{B}_k$.
+\end{enumerate}
+
+\textbf{Global perturbation.} Small additive noise on all coordinates with $\sigma_{\text{global}} \ll \sigma_{\text{single}}$, allowing gentle breathing of the entire assembly.
+
+All move types are followed by \textbf{standard Metropolis--Hastings} accept/reject on the full log-posterior. The target distribution is unchanged; only the proposal changes.
+
+\begin{algorithm}[H]
+\caption{Mixed-Move MCMC Mutation (one step within SMC)}
+\begin{algorithmic}[1]
+\Require Current position $\bX$, log-posterior $\log\pi_t$, interaction graph $G$
+\State Sample $u \sim \text{Uniform}(0,1)$
+\If{$u < p_{\text{single}}$}
+    \State $\bX' \gets \bX + \boldsymbol{\epsilon}$, \quad $\boldsymbol{\epsilon} \sim \Normal(\mathbf{0}, \sigma_{\text{single}}^2 I)$
+\ElsIf{$u < p_{\text{single}} + p_{\text{rigid}}$}
+    \State Compute $\Pi_K(\bX)$ via MST on $G(\bX)$ \Comment{Eq.~\ref{eq:mst_pipeline}}
+    \State Pick $\mathcal{B}_k$ uniformly at random
+    \State Sample $(\mathbf{t}_k, R_k)$; apply rigid transform to $\mathcal{B}_k$ \Comment{Eq.~\ref{eq:rigid_transform}}
+    \State $\bX' \gets$ transformed configuration
+\Else
+    \State $\bX' \gets \bX + \boldsymbol{\epsilon}$, \quad $\boldsymbol{\epsilon} \sim \Normal(\mathbf{0}, \sigma_{\text{global}}^2 I)$
+\EndIf
+\State $\log\alpha \gets \log\pi_t(\bX') - \log\pi_t(\bX)$
+\State Accept $\bX'$ with probability $\min(1, e^{\log\alpha})$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}[Rigid Body Moves and SMC Tempering]
+The mixed-move kernel is particularly powerful within SMC. At low temperatures ($\lambda_t \approx 0$), the log-posterior is dominated by the prior and particles are dispersed---single-particle moves suffice. As $\lambda_t$ increases and particles form clusters, the MST partition improves and rigid body moves become increasingly effective, enabling large-scale rearrangements that would otherwise be frozen out by the sharpening likelihood. This adaptive interplay between tempering and data-driven grouping is a key advantage of combining SMC with MST-based proposals.
+\end{remark}
 
 % ===========================================================================
 \section{Implementation in JAX}
@@ -568,7 +816,7 @@ This ensures efficient exploration of both coordinate space and nuisance paramet
 We concatenate all parameters into a single vector for BlackJAX:
 \begin{equation}
     \btheta = [\underbrace{x_1, y_1, z_1, \ldots, x_N, y_N, z_N}_{3N \text{ coordinates}}, 
-               \underbrace{\sigma_{\text{tet}}, \sigma_{\text{xl}}, \sigma_{\text{EM}}, \tau}_{4 \text{ nuisance params}}]
+               \underbrace{\sigma_{\text{tet}}, \sigma_{\text{xl}}, \sigma_{\text{EM}}, \sigma_{\text{apms}}, \tau}_{5 \text{ nuisance params}}]
 \end{equation}
 
 \subsection{Code Structure}
@@ -576,15 +824,17 @@ We concatenate all parameters into a single vector for BlackJAX:
 \begin{verbatim}
 def unpack_state(state):
     """Split state into coordinates and nuisance parameters."""
-    coords = state[:-4].reshape(-1, 3)
-    sigma_tet = state[-4]
-    sigma_xl = state[-3]
-    sigma_em = state[-2]
+    coords = state[:-5].reshape(-1, 3)
+    sigma_tet = state[-5]
+    sigma_xl = state[-4]
+    sigma_em = state[-3]
+    sigma_apms = state[-2]
     tau = state[-1]
-    return coords, sigma_tet, sigma_xl, sigma_em, tau
+    return coords, sigma_tet, sigma_xl, sigma_em, sigma_apms, tau
 
 def log_prior_fn(state):
-    coords, sigma_tet, sigma_xl, sigma_em, tau = unpack_state(state)
+    coords, sigma_tet, sigma_xl, sigma_em, sigma_apms, tau = \
+        unpack_state(state)
     
     # Coordinate prior (in box)
     logp = log_box_prior(coords)
@@ -596,11 +846,13 @@ def log_prior_fn(state):
     logp += half_cauchy_logpdf(sigma_tet, scale=tau)
     logp += half_cauchy_logpdf(sigma_xl, scale=3.0 * tau)
     logp += half_cauchy_logpdf(sigma_em, scale=5.0 * tau)
+    logp += half_cauchy_logpdf(sigma_apms, scale=2.0 * tau)
     
     return logp
 
 def log_likelihood_fn(state):
-    coords, sigma_tet, sigma_xl, sigma_em, tau = unpack_state(state)
+    coords, sigma_tet, sigma_xl, sigma_em, sigma_apms, tau = \
+        unpack_state(state)
     
     # Level 1: Tetramer distances
     loglik = tetramer_log_likelihood(coords, sigma_tet)
@@ -610,6 +862,9 @@ def log_likelihood_fn(state):
     
     # Level 3: EM density
     loglik += em_log_likelihood(coords, sigma_em)
+    
+    # Level 4: AP-MS contact satisfaction
+    loglik += apms_log_likelihood(coords, sigma_apms)
     
     return loglik
 
@@ -713,7 +968,7 @@ provides an estimate of the marginal likelihood $p(\mathcal{D})$, useful for:
 \begin{itemize}
     \item \textbf{Per-restraint nuisance parameters:} $\sigma_{ij}$ for each distance restraint, with a shared prior
     \item \textbf{Outlier modeling:} Mixture models for false positive cross-links
-    \item \textbf{Rigid body representation:} Reduce DOF by treating tetramers as rigid units
+    \item \textbf{Adaptive rigid body detection:} Extend the MST partition to variable $K$ (infer the number of rigid bodies from data) or use spectral clustering for soft assignments
     \item \textbf{Multiple conformations:} Explicit mixture of structures to model discrete heterogeneity
     \item \textbf{Hierarchical copy numbers:} Treat stoichiometry as a latent variable
 \end{itemize}
@@ -736,28 +991,42 @@ The complete model in plate notation:
 \node[above=0.3cm of tau, font=\small\bfseries] {System Disorder};
 
 % Nuisance parameters
-\node[latent, below left=1cm and 1.5cm of tau] (s1) {$\sigma_{\text{tet}}$};
-\node[latent, below=1cm of tau] (s2) {$\sigma_{\text{xl}}$};
-\node[latent, below right=1cm and 1.5cm of tau] (s3) {$\sigma_{\text{EM}}$};
+\node[latent, below left=1cm and 2.5cm of tau] (s1) {$\sigma_{\text{tet}}$};
+\node[latent, below left=1cm and 0.8cm of tau] (s2) {$\sigma_{\text{xl}}$};
+\node[latent, below right=1cm and 0.8cm of tau] (s3) {$\sigma_{\text{EM}}$};
+\node[latent, below right=1cm and 2.5cm of tau] (s4) {$\sigma_{\text{apms}}$};
 
 % Coordinates
-\node[latent, below=2cm of tau] (X) {$\bX$};
+\node[latent, below=2.5cm of tau] (X) {$\bX$};
+
+% MST node
+\node[rectangle, draw, fill=yellow!10, minimum width=1.2cm, minimum height=0.7cm, right=1.8cm of X, font=\small] (mst) {MST $\Pi_K$};
 
 % Observations
-\node[obs, below left=1cm and 1.5cm of X] (d1) {$\mathcal{D}_{\text{tet}}$};
-\node[obs, below=1cm of X] (d2) {$\mathcal{D}_{\text{xl}}$};
-\node[obs, below right=1cm and 1.5cm of X] (d3) {$\mathcal{D}_{\text{EM}}$};
+\node[obs, below left=1cm and 2.5cm of X] (d1) {$\mathcal{D}_{\text{tet}}$};
+\node[obs, below left=1cm and 0.8cm of X] (d2) {$\mathcal{D}_{\text{xl}}$};
+\node[obs, below right=1cm and 0.8cm of X] (d3) {$\mathcal{D}_{\text{EM}}$};
+\node[obs, below right=1cm and 2.5cm of X] (d4) {$\mathcal{D}_{\text{apms}}$};
 
-% Arrows
+% Arrows from tau
 \draw[->, blue!50, thick] (tau) -- (s1);
 \draw[->, blue!50, thick] (tau) -- (s2);
 \draw[->, blue!50, thick] (tau) -- (s3);
+\draw[->, blue!50, thick] (tau) -- (s4);
+% Arrows from sigmas to data
 \draw[->] (s1) -- (d1);
 \draw[->] (s2) -- (d2);
 \draw[->] (s3) -- (d3);
+\draw[->] (s4) -- (d4);
+% Arrows from X to data
 \draw[->] (X) -- (d1);
 \draw[->] (X) -- (d2);
 \draw[->] (X) -- (d3);
+\draw[->] (X) -- (d4);
+% MST connections
+\draw[->, thick, dashed, orange!70] (X) -- (mst);
+\draw[->, thick, dashed, orange!70] (d4) -- (mst);
+\node[right=0.1cm of mst, font=\tiny, text width=2cm] {Defines rigid body proposals};
 
 \end{tikzpicture}
 \end{center}

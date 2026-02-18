@@ -31,7 +31,13 @@ from representation.particle_system import ParticleSystem, get_ideal_coords
 from scoring.energy import log_probability
 from sampling.smc import run_tempered_smc, get_smc_samples, get_best_sample
 from io_utils.io_handlers import save_mcmc_to_hdf5
-from scoring.em_score import (
+#from scoring.em_score import (
+#    create_em_config_from_mrcfile,
+#    create_em_scoring_model,
+#    calculate_ccc_jax,
+#    diagnose_model,
+#)
+from scoring.adapted_em_score import (
     create_em_config_from_mrcfile,
     create_em_scoring_model,
     calculate_ccc_jax,
@@ -115,6 +121,8 @@ def main():
     timer.start("2. Load density map")
 
     mrc_path = output_dir / "simulated_target_density.mrc"
+    #mrc_path = output_dir / "target_map_filled.mrc"
+    #mrc_path = output_dir / "50res_map.mrc"
     resolution = 50.0
 
     print(f"\nLoading target density: {mrc_path}")
@@ -135,9 +143,9 @@ def main():
 
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
 
-    init_box_size = 250.0
+    init_box_size = 300.0
     coords = temp_system.get_random_coords(
-        jax.random.PRNGKey(128907189),
+        jax.random.PRNGKey(12897189),
         box_size=[init_box_size, init_box_size, init_box_size],
     )
 
@@ -167,9 +175,9 @@ def main():
     #     0.005 -> log_prior ~ -32   (moderate)
     #     0.01  -> log_prior ~ -64   (strong)
 
-    sigma_ccc = 0.0025
-    lambda_attract = 0.03
-    box_size = 250.0
+    sigma_ccc = 0.005
+    lambda_attract = 0.1
+    box_size = 300.0
     box_steepness = 1.0
 
     print(f"\nProbabilistic model:")
@@ -199,7 +207,7 @@ def main():
         struct_term = log_probability(
             flat_coords, system, flat_radii,
             target_dists, nuisance_params,
-            exclusion_weight=1.0, pair_weight=0.0001, exvol_sigma=0.10,
+            exclusion_weight=1.0, pair_weight=0.000001, exvol_sigma=0.10,
         )
         return ccc_term + struct_term
 
@@ -241,7 +249,7 @@ def main():
     struct_val = log_probability(
         dummy_coords, system, flat_radii,
         target_dists, nuisance_params,
-        exclusion_weight=1.0, pair_weight=0.075, exvol_sigma=0.10,
+        exclusion_weight=1.0, pair_weight=0.000001, exvol_sigma=0.10,
     )
 
     print(f"  log_prior:                 {float(prior_val):>12.4f}")
@@ -272,7 +280,7 @@ def main():
     # =========================================================================
     timer.start("6. Initialize SMC particles")
 
-    n_particles = 150
+    n_particles = 250
     rng_key = jax.random.PRNGKey(90998210)
     rng_key, init_key = jax.random.split(rng_key)
 
@@ -322,9 +330,9 @@ def main():
     #   0.75 = conservative (smaller λ increments, more steps)
     #   0.9 = very conservative
 
-    n_mcmc_steps = 25
-    rmh_sigma = 2.0
-    target_ess = 0.55
+    n_mcmc_steps = 40
+    rmh_sigma = 3.5
+    target_ess = 0.65
 
     print(f"\nSMC configuration:")
     print(f"  MCMC steps per temp:  {n_mcmc_steps}")

@@ -69,7 +69,7 @@ class SMCConfig:
     kernel: Literal['rmh', 'hmc'] = 'rmh'
     
     # System parameters
-    n_particles: int = 50  # SMC particles
+    n_particles: int = 100  # SMC particles
     random_seed: int = 42
     
     # Density map
@@ -88,21 +88,21 @@ class SMCConfig:
     # Prior parameters
     box_size: float = 300.0  # Bounding box size
     box_steepness: float = 10.0  # Soft box penalty strength
-    slope_factor: float = 0.01  # Attraction to density COM
+    slope_factor: float = 0.001  # Attraction to density COM
     
     # Excluded volume
-    exvol_stiffness: float = 10.0  # Overlap penalty strength
+    exvol_stiffness: float = 0.1  # Overlap penalty strength
     
     # Structural restraints (optional)
     use_structural_restraints: bool = False
     pair_weight: float = 0.000001
     
     # SMC parameters
-    n_mcmc_steps: int = 50
-    target_ess: float = 0.5
+    n_mcmc_steps: int = 80
+    target_ess: float = 0.75
     
     # RMH-specific
-    rmh_sigma: float = 3.0  # Proposal step size
+    rmh_sigma: float = 4.0  # Proposal step size
     
     # HMC-specific
     hmc_step_size: float = 0.01

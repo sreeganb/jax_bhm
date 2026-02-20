@@ -249,17 +249,20 @@ def calc_cg_density(
     nz, ny, nx = grid_z.shape[0], grid_y.shape[0], grid_x.shape[0]
 
     # Convert radii → Gaussian sigmas in Å
-    sigmas = jnp.array([radius_to_sigma(float(r)) for r in np.asarray(radii)])
+    # Use JAX-safe sqrt instead of calling float() on each radius
+    sigmas = radii * jnp.sqrt(3.0 / 5.0)
 
     if group_by_radius:
         # Group beads by unique sigma for efficient batched computation
-        unique_sigmas = jnp.unique(sigmas)
+        # Use numpy for grouping logic (concrete values needed for control flow)
+        radii_np = np.asarray(radii)
+        unique_radii_np = np.unique(radii_np)
         density = jnp.zeros((nz, ny, nx), dtype=jnp.float32)
 
-        for s in unique_sigmas:
-            s_val = float(s)
-            mask = jnp.isclose(sigmas, s)
-            idx = jnp.where(mask, size=int(jnp.sum(mask)))[0]
+        for r_val in unique_radii_np:
+            s_val = float(r_val) * math.sqrt(3.0 / 5.0)
+            mask_np = np.isclose(radii_np, r_val)
+            idx = np.where(mask_np)[0]
             grp_centers = coords[idx]
             grp_masses = masses[idx]
             density = density + _gaussian_blob_density_same_sigma(
@@ -272,8 +275,9 @@ def calc_cg_density(
 
     # Optional resolution smoothing
     if resolution is not None:
-        voxel_size = float(bins[0][1] - bins[0][0])
-        sigma_res = resolution_to_sigma(resolution, voxel_size)
+        # Compute voxel_size in a JAX-safe way (no float() cast)
+        voxel_size = bins[0][1] - bins[0][0]
+        sigma_res = resolution / (4.0 * jnp.sqrt(2.0 * jnp.log(2.0))) / voxel_size
         density = _apply_resolution_smoothing(density, sigma_res)
 
     return density

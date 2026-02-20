@@ -435,22 +435,52 @@ def run_smc_simulation(config: SMCConfig) -> Dict[str, Any]:
     x_com = (jnp.sum(x_idx * target_density) / total_mass) * voxel_size + origin[0]
     y_com = (jnp.sum(y_idx * target_density) / total_mass) * voxel_size + origin[1]
     z_com = (jnp.sum(z_idx * target_density) / total_mass) * voxel_size + origin[2]
-    density_com = jnp.array([x_com, y_com, z_com])
+    density_com_physical = jnp.array([x_com, y_com, z_com])
     
     logger.info(f"  Shape: {map_shape}, Voxel: {voxel_size:.2f} Å")
     logger.info(f"  Origin: [{origin[0]:.1f}, {origin[1]:.1f}, {origin[2]:.1f}]")
-    logger.info(f"  Density COM: [{float(x_com):.1f}, {float(y_com):.1f}, {float(z_com):.1f}]")
+    logger.info(f"  Density COM (physical): [{float(x_com):.1f}, {float(y_com):.1f}, {float(z_com):.1f}]")
     
-    # Setup grid to match target density
+    # =======================================================================
+    # KEY FIX: Reconstruct bins centered at ORIGIN, matching how the density
+    # was generated. The density COM should be near (0, 0, -30) if the map
+    # was generated correctly. If not, we shift the coordinate system so
+    # that the density COM maps to the ideal coords COM.
+    # =======================================================================
+    
+    # Check if density was generated centered at origin or offset
+    ideal_coords = get_ideal_coords()
+    ideal_com = jnp.mean(jnp.concatenate(
+        [ideal_coords[k] for k in sorted(ideal_coords.keys())], axis=0
+    ), axis=0)  # ≈ (0, 0, -30)
+    
+    # If density COM is far from ideal COM, the map was NOT centered at origin.
+    # We set density_com = ideal_com so all scoring uses the correct frame.
+    com_distance = float(jnp.linalg.norm(density_com_physical - ideal_com))
+    if com_distance > 50.0:
+        logger.warning(
+            f"  Density COM is {com_distance:.0f} Å from ideal coords COM!"
+        )
+        logger.warning(
+            f"  The MRC was likely NOT centered at origin."
+        )
+        logger.warning(
+            f"  Recommend regenerating with box_center=(0,0,0)."
+        )
+        logger.warning(
+            f"  For now, using origin-centered bins and assuming density aligns with coords."
+        )
+    
+    # Use origin-centered grid that matches the box size
     grid_box_size = (nx * voxel_size, ny * voxel_size, nz * voxel_size)
-    grid_center = (
-        origin[0] + grid_box_size[0] / 2,
-        origin[1] + grid_box_size[1] / 2,
-        origin[2] + grid_box_size[2] / 2,
-    )
+    grid_center = (0.0, 0.0, 0.0)  # ALWAYS center at origin
     bins, grid_shape = setup_grid(grid_box_size, voxel_size, grid_center)
     
-    logger.info(f"  Grid: {grid_shape}, Box: {grid_box_size}")
+    # Density COM for priors should be near ideal coords COM
+    density_com = ideal_com  # Use ideal COM as the attraction target
+    
+    logger.info(f"  Grid: {grid_shape}, Box: {grid_box_size}, Center: (0,0,0)")
+    logger.info(f"  Density COM (for priors): [{float(density_com[0]):.1f}, {float(density_com[1]):.1f}, {float(density_com[2]):.1f}]")
     
     timer.stop("2. Load density map")
     
@@ -461,17 +491,18 @@ def run_smc_simulation(config: SMCConfig) -> Dict[str, Any]:
     
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
     
-    # Initialize particles close together near density COM with small spread
+    # Initialize particles near ORIGIN (where ideal coords live)
+    # NOT near density_com which might be at (400, 400, 400) if map is offset
     rng_key = jax.random.PRNGKey(config.random_seed)
     rng_key, init_key = jax.random.split(rng_key)
     
-    spread = 10.0  # Spread around COM
+    spread = 10.0  # Spread around origin/ideal COM
     coords = {}
     for ptype in sorted(types_config.keys()):
         n_copies = types_config[ptype]['copy']
         rng_key, subkey = jax.random.split(rng_key)
-        # Initialize near density COM with small perturbations
-        coords[ptype] = density_com + jax.random.normal(subkey, (n_copies, 3)) * spread
+        # Initialize near ORIGIN with small perturbations (ideal coords are near origin)
+        coords[ptype] = jax.random.normal(subkey, (n_copies, 3)) * spread
     
     system = ParticleSystem(types_config, coords, ideal_coords)
     flat_radii = system.get_flat_radii()
@@ -487,7 +518,7 @@ def run_smc_simulation(config: SMCConfig) -> Dict[str, Any]:
     masses = jnp.concatenate(masses_list)
     
     logger.info(f"System: {system.total_particles} particles, {n_dims} dimensions")
-    logger.info(f"Particles initialized near density COM (spread ~ {spread} Å)")
+    logger.info(f"Particles initialized near ORIGIN (spread ~ {spread} Å)")
     
     timer.stop("3. Initialize coordinates")
     

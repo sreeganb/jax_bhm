@@ -215,7 +215,7 @@ def main(
         resolution=resolution,
         voxel_size=voxel_size,
         box_size=(box_size, box_size, box_size),
-        box_center=(float(com[0]), float(com[1]), float(com[2])),
+        box_center=(0.0, 0.0, 0.0),  # CENTER AT ORIGIN, not at COM
         output_path=output_path,
     )
     

@@ -631,6 +631,15 @@ def _demo():
     bins, grid_shape = setup_grid(box_size, voxel_size, center=center)
     print(f"Grid shape: {grid_shape}")
 
+    # Get voxel size from the first dimension (assume isotropic)
+    # Use JAX-safe scalar extraction
+    voxel_size = bins[0][1] - bins[0][0]
+    
+    # 3. Compute density
+    # ----------------
+    # Sigma for the Gaussian kernels
+    sigmas = jnp.array([radius_to_sigma(float(r)) for r in np.asarray(radii)])
+
     # Generate density (bead Gaussians only)
     density_intrinsic = calc_cg_density(coords, masses, radii, bins, resolution=None)
     print(f"Intrinsic density: min={float(density_intrinsic.min()):.4g}, "

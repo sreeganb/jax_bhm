@@ -8,7 +8,7 @@
 \usepackage{hyperref}
 \usepackage{natbib}
 \usepackage{algorithm}
-\usepackage{algpseudocode}
+\usepackage{algorithmic}
 \usepackage{tikz}
 \usetikzlibrary{arrows,shapes,positioning,calc,fit}
 
@@ -718,16 +718,16 @@ where $0 = \lambda_0 < \lambda_1 < \cdots < \lambda_T = 1$ is the tempering sche
 \begin{algorithm}[H]
 \caption{Adaptive Tempered SMC}
 \begin{algorithmic}[1]
-\State \textbf{Initialize:} Sample $\{\btheta^{(i)}\}_{i=1}^{M}$ from prior $p(\btheta)$
-\State Set $\lambda_0 = 0$, $t = 0$
-\While{$\lambda_t < 1$}
-    \State \textbf{Adapt $\lambda$:} Find $\lambda_{t+1}$ such that $\text{ESS} = M/2$
-    \State \textbf{Reweight:} $w^{(i)} \propto p(\mathcal{D} \mid \btheta^{(i)})^{\lambda_{t+1} - \lambda_t}$
-    \State \textbf{Resample:} if ESS too low, resample according to weights
-    \State \textbf{Move:} Apply MCMC kernel targeting $\pi_{t+1}$ to each particle
-    \State $t \gets t + 1$
-\EndWhile
-\State \textbf{Return:} Weighted samples $\{(\btheta^{(i)}, w^{(i)})\}_{i=1}^{M}$
+\STATE \textbf{Initialize:} Sample $\{\btheta^{(i)}\}_{i=1}^{M}$ from prior $p(\btheta)$
+\STATE Set $\lambda_0 = 0$, $t = 0$
+\WHILE{$\lambda_t < 1$}
+    \STATE \textbf{Adapt $\lambda$:} Find $\lambda_{t+1}$ such that $\text{ESS} = M/2$
+    \STATE \textbf{Reweight:} $w^{(i)} \propto p(\mathcal{D} \mid \btheta^{(i)})^{\lambda_{t+1} - \lambda_t}$
+    \STATE \textbf{Resample:} if ESS too low, resample according to weights
+    \STATE \textbf{Move:} Apply MCMC kernel targeting $\pi_{t+1}$ to each particle
+    \STATE $t \gets t + 1$
+\ENDWHILE
+\STATE \textbf{Return:} Weighted samples $\{(\btheta^{(i)}, w^{(i)})\}_{i=1}^{M}$
 \end{algorithmic}
 \end{algorithm}
 
@@ -786,20 +786,20 @@ All move types are followed by \textbf{standard Metropolis--Hastings} accept/rej
 \begin{algorithm}[H]
 \caption{Mixed-Move MCMC Mutation (one step within SMC)}
 \begin{algorithmic}[1]
-\Require Current position $\bX$, log-posterior $\log\pi_t$, interaction graph $G$
-\State Sample $u \sim \text{Uniform}(0,1)$
-\If{$u < p_{\text{single}}$}
-    \State $\bX' \gets \bX + \boldsymbol{\epsilon}$, \quad $\boldsymbol{\epsilon} \sim \Normal(\mathbf{0}, \sigma_{\text{single}}^2 I)$
-\ElsIf{$u < p_{\text{single}} + p_{\text{rigid}}$}
-    \State Compute $\Pi_K(\bX)$ via MST on $G(\bX)$ \Comment{Eq.~\ref{eq:mst_pipeline}}
-    \State Pick $\mathcal{B}_k$ uniformly at random
-    \State Sample $(\mathbf{t}_k, R_k)$; apply rigid transform to $\mathcal{B}_k$ \Comment{Eq.~\ref{eq:rigid_transform}}
-    \State $\bX' \gets$ transformed configuration
-\Else
-    \State $\bX' \gets \bX + \boldsymbol{\epsilon}$, \quad $\boldsymbol{\epsilon} \sim \Normal(\mathbf{0}, \sigma_{\text{global}}^2 I)$
-\EndIf
-\State $\log\alpha \gets \log\pi_t(\bX') - \log\pi_t(\bX)$
-\State Accept $\bX'$ with probability $\min(1, e^{\log\alpha})$
+\REQUIRE Current position $\bX$, log-posterior $\log\pi_t$, interaction graph $G$
+\STATE Sample $u \sim \text{Uniform}(0,1)$
+\IF{$u < p_{\text{single}}$}
+    \STATE $\bX' \gets \bX + \boldsymbol{\epsilon}$, \quad $\boldsymbol{\epsilon} \sim \Normal(\mathbf{0}, \sigma_{\text{single}}^2 I)$
+\ELSIF{$u < p_{\text{single}} + p_{\text{rigid}}$}
+    \STATE Compute $\Pi_K(\bX)$ via MST on $G(\bX)$ \COMMENT{Eq.~\ref{eq:mst_pipeline}}
+    \STATE Pick $\mathcal{B}_k$ uniformly at random
+    \STATE Sample $(\mathbf{t}_k, R_k)$; apply rigid transform to $\mathcal{B}_k$ \COMMENT{Eq.~\ref{eq:rigid_transform}}
+    \STATE $\bX' \gets$ transformed configuration
+\ELSE
+    \STATE $\bX' \gets \bX + \boldsymbol{\epsilon}$, \quad $\boldsymbol{\epsilon} \sim \Normal(\mathbf{0}, \sigma_{\text{global}}^2 I)$
+\ENDIF
+\STATE $\log\alpha \gets \log\pi_t(\bX') - \log\pi_t(\bX)$
+\STATE Accept $\bX' $ with probability $\min(1, e^{\log\alpha})$
 \end{algorithmic}
 \end{algorithm}
 
@@ -883,6 +883,7 @@ After SMC sampling, we obtain posterior distributions for all nuisance parameter
     \item $p(\sigma_{\text{tet}} \mid \mathcal{D})$: Inferred precision of tetramer measurements
     \item $p(\sigma_{\text{xl}} \mid \mathcal{D})$: Inferred precision of XL-MS
     \item $p(\sigma_{\text{EM}} \mid \mathcal{D})$: Inferred weight of EM data
+    \item $p(\sigma_{\text{apms}} \mid \mathcal{D})$: Inferred tolerance for AP-MS contact satisfaction
     \item $p(\tau \mid \mathcal{D})$: Overall system state disorder
 \end{itemize}
 
@@ -910,7 +911,7 @@ The hierarchical structure allows us to distinguish two scenarios:
 
 \textbf{Scenario 1: One noisy experiment}
 \begin{itemize}
-    \item $\sigma_{\text{xl}}$ is large, but $\sigma_{\text{tet}}$ and $\sigma_{\text{EM}}$ are small
+    \item $\sigma_{\text{xl}}$ is large, but $\sigma_{\text{tet}}$, $\sigma_{\text{EM}}$, and $\sigma_{\text{apms}}$ are small
     \item $\tau$ remains small
     \item Interpretation: XL-MS has instrumental problems; other data are reliable
 \end{itemize}

@@ -73,9 +73,9 @@ class SMCConfig:
     random_seed: int = 42
     
     # Density map
-    mrc_path: str = "output/simulated_target_density.mrc"
+    mrc_path: str = "output/synthetic_ideal_density.mrc"
     resolution: float = 50.0
-    voxel_size: float = 5.0
+    voxel_size: float = 3.0
     
     # Grid setup (will be computed from map or specified)
     grid_box_size: tuple = (300.0, 300.0, 300.0)

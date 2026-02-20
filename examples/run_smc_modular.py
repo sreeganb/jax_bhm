@@ -227,9 +227,14 @@ def create_scoring_functions(
     logger.info("Building scoring functions...")
     
     # === Log prior: soft box + linear slope attraction ===
+    # Center the box on the density COM, not on origin
     box_half = config.box_size / 2.0
-    box_mins = jnp.array([-box_half, -box_half, -box_half])
-    box_maxs = jnp.array([box_half, box_half, box_half])
+    box_mins = density_com - box_half
+    box_maxs = density_com + box_half
+    
+    logger.info(f"  Box centered at density COM: [{float(density_com[0]):.1f}, {float(density_com[1]):.1f}, {float(density_com[2]):.1f}]")
+    logger.info(f"  Box mins: [{float(box_mins[0]):.1f}, {float(box_mins[1]):.1f}, {float(box_mins[2]):.1f}]")
+    logger.info(f"  Box maxs: [{float(box_maxs[0]):.1f}, {float(box_maxs[1]):.1f}, {float(box_maxs[2]):.1f}]")
     
     @jax.jit
     def log_prior_fn(flat_coords: jnp.ndarray) -> jnp.ndarray:
@@ -426,8 +431,53 @@ def run_smc_simulation(config: SMCConfig) -> Dict[str, Any]:
         )
         map_shape = mrc.data.shape
     
-    # Compute density center of mass
     nz, ny, nx = map_shape
+    
+    logger.info(f"  Shape: {map_shape}, Voxel: {voxel_size:.2f} Å")
+    logger.info(f"  Origin: [{origin[0]:.1f}, {origin[1]:.1f}, {origin[2]:.1f}]")
+    
+    # =======================================================================
+    # Reconstruct bins from MRC header so they match the density data exactly.
+    #
+    # The MRC origin tells us where voxel (0,0,0) sits in physical space.
+    # bins[i] = origin[i] + np.arange(n_i + 1) * voxel_size
+    #
+    # This is the ONLY correct way to get bins — they must correspond to
+    # how the density was generated. If we use different bins, the CCC
+    # computation will correlate the wrong spatial regions.
+    # =======================================================================
+    binsx = jnp.linspace(
+        origin[0], origin[0] + nx * voxel_size, nx + 1, dtype=jnp.float32
+    )
+    binsy = jnp.linspace(
+        origin[1], origin[1] + ny * voxel_size, ny + 1, dtype=jnp.float32
+    )
+    binsz = jnp.linspace(
+        origin[2], origin[2] + nz * voxel_size, nz + 1, dtype=jnp.float32
+    )
+    bins = (binsx, binsy, binsz)
+    grid_shape = (nx, ny, nz)
+    
+    # Compute grid center and box size from bins
+    grid_center = (
+        float((binsx[0] + binsx[-1]) / 2),
+        float((binsy[0] + binsy[-1]) / 2),
+        float((binsz[0] + binsz[-1]) / 2),
+    )
+    grid_box_size = (
+        float(binsx[-1] - binsx[0]),
+        float(binsy[-1] - binsy[0]),
+        float(binsz[-1] - binsz[0]),
+    )
+    
+    logger.info(f"  Grid: {grid_shape}")
+    logger.info(f"  Grid box: {grid_box_size}")
+    logger.info(f"  Grid center: ({grid_center[0]:.1f}, {grid_center[1]:.1f}, {grid_center[2]:.1f})")
+    logger.info(f"  X range: [{float(binsx[0]):.1f}, {float(binsx[-1]):.1f}]")
+    logger.info(f"  Y range: [{float(binsy[0]):.1f}, {float(binsy[-1]):.1f}]")
+    logger.info(f"  Z range: [{float(binsz[0]):.1f}, {float(binsz[-1]):.1f}]")
+    
+    # Compute density center of mass in physical coordinates
     z_idx, y_idx, x_idx = jnp.meshgrid(
         jnp.arange(nz), jnp.arange(ny), jnp.arange(nx), indexing='ij'
     )
@@ -435,52 +485,44 @@ def run_smc_simulation(config: SMCConfig) -> Dict[str, Any]:
     x_com = (jnp.sum(x_idx * target_density) / total_mass) * voxel_size + origin[0]
     y_com = (jnp.sum(y_idx * target_density) / total_mass) * voxel_size + origin[1]
     z_com = (jnp.sum(z_idx * target_density) / total_mass) * voxel_size + origin[2]
-    density_com_physical = jnp.array([x_com, y_com, z_com])
+    density_com = jnp.array([float(x_com), float(y_com), float(z_com)])
     
-    logger.info(f"  Shape: {map_shape}, Voxel: {voxel_size:.2f} Å")
-    logger.info(f"  Origin: [{origin[0]:.1f}, {origin[1]:.1f}, {origin[2]:.1f}]")
-    logger.info(f"  Density COM (physical): [{float(x_com):.1f}, {float(y_com):.1f}, {float(z_com):.1f}]")
+    logger.info(f"  Density COM: [{float(x_com):.1f}, {float(y_com):.1f}, {float(z_com):.1f}]")
     
-    # =======================================================================
-    # KEY FIX: Reconstruct bins centered at ORIGIN, matching how the density
-    # was generated. The density COM should be near (0, 0, -30) if the map
-    # was generated correctly. If not, we shift the coordinate system so
-    # that the density COM maps to the ideal coords COM.
-    # =======================================================================
-    
-    # Check if density was generated centered at origin or offset
+    # Check consistency: ideal coords should be within the grid
     ideal_coords = get_ideal_coords()
     ideal_com = jnp.mean(jnp.concatenate(
         [ideal_coords[k] for k in sorted(ideal_coords.keys())], axis=0
-    ), axis=0)  # ≈ (0, 0, -30)
+    ), axis=0)
     
-    # If density COM is far from ideal COM, the map was NOT centered at origin.
-    # We set density_com = ideal_com so all scoring uses the correct frame.
-    com_distance = float(jnp.linalg.norm(density_com_physical - ideal_com))
+    com_distance = float(jnp.linalg.norm(density_com - ideal_com))
+    logger.info(f"  Ideal coords COM: [{float(ideal_com[0]):.1f}, {float(ideal_com[1]):.1f}, {float(ideal_com[2]):.1f}]")
+    logger.info(f"  Distance (density COM <-> ideal COM): {com_distance:.1f} Å")
+    
+    # Verify ideal coords are within grid bounds
+    all_ideal = jnp.concatenate([ideal_coords[k] for k in sorted(ideal_coords.keys())], axis=0)
+    in_x = (jnp.min(all_ideal[:, 0]) >= binsx[0]) & (jnp.max(all_ideal[:, 0]) <= binsx[-1])
+    in_y = (jnp.min(all_ideal[:, 1]) >= binsy[0]) & (jnp.max(all_ideal[:, 1]) <= binsy[-1])
+    in_z = (jnp.min(all_ideal[:, 2]) >= binsz[0]) & (jnp.max(all_ideal[:, 2]) <= binsz[-1])
+    coords_inside_grid = bool(in_x & in_y & in_z)
+    
+    if not coords_inside_grid:
+        logger.error("!!! IDEAL COORDINATES ARE OUTSIDE THE DENSITY GRID !!!")
+        logger.error("The MRC file grid does not contain the ideal coordinate region.")
+        logger.error("Please regenerate the MRC with box_center=(0,0,0):")
+        logger.error("  python examples/generate_synthetic_density.py --output output/synthetic_ideal_density.mrc")
+        raise ValueError(
+            f"Coordinate/density grid mismatch: ideal coords COM at "
+            f"({float(ideal_com[0]):.0f}, {float(ideal_com[1]):.0f}, {float(ideal_com[2]):.0f}) "
+            f"but grid spans [{float(binsx[0]):.0f}, {float(binsx[-1]):.0f}] in X. "
+            f"Regenerate the MRC centered at origin."
+        )
+    
     if com_distance > 50.0:
-        logger.warning(
-            f"  Density COM is {com_distance:.0f} Å from ideal coords COM!"
-        )
-        logger.warning(
-            f"  The MRC was likely NOT centered at origin."
-        )
-        logger.warning(
-            f"  Recommend regenerating with box_center=(0,0,0)."
-        )
-        logger.warning(
-            f"  For now, using origin-centered bins and assuming density aligns with coords."
-        )
-    
-    # Use origin-centered grid that matches the box size
-    grid_box_size = (nx * voxel_size, ny * voxel_size, nz * voxel_size)
-    grid_center = (0.0, 0.0, 0.0)  # ALWAYS center at origin
-    bins, grid_shape = setup_grid(grid_box_size, voxel_size, grid_center)
-    
-    # Density COM for priors should be near ideal coords COM
-    density_com = ideal_com  # Use ideal COM as the attraction target
-    
-    logger.info(f"  Grid: {grid_shape}, Box: {grid_box_size}, Center: (0,0,0)")
-    logger.info(f"  Density COM (for priors): [{float(density_com[0]):.1f}, {float(density_com[1]):.1f}, {float(density_com[2]):.1f}]")
+        logger.warning(f"  Density COM is {com_distance:.0f} Å from ideal coords COM.")
+        logger.warning(f"  This may indicate an alignment issue.")
+    else:
+        logger.info(f"  ✓ Density COM and ideal coords COM are within {com_distance:.1f} Å")
     
     timer.stop("2. Load density map")
     
@@ -491,18 +533,20 @@ def run_smc_simulation(config: SMCConfig) -> Dict[str, Any]:
     
     temp_system = ParticleSystem(types_config, {}, ideal_coords)
     
-    # Initialize particles near ORIGIN (where ideal coords live)
-    # NOT near density_com which might be at (400, 400, 400) if map is offset
+    # Initialize particles near the DENSITY COM (where the actual density is)
     rng_key = jax.random.PRNGKey(config.random_seed)
     rng_key, init_key = jax.random.split(rng_key)
     
-    spread = 10.0  # Spread around origin/ideal COM
+    spread = 50.0
     coords = {}
     for ptype in sorted(types_config.keys()):
         n_copies = types_config[ptype]['copy']
         rng_key, subkey = jax.random.split(rng_key)
-        # Initialize near ORIGIN with small perturbations (ideal coords are near origin)
-        coords[ptype] = jax.random.normal(subkey, (n_copies, 3)) * spread
+        # Initialize near density COM
+        coords[ptype] = (
+            jax.random.normal(subkey, (n_copies, 3)) * spread 
+            + density_com[None, :]  # offset to density COM
+        )
     
     system = ParticleSystem(types_config, coords, ideal_coords)
     flat_radii = system.get_flat_radii()
@@ -518,7 +562,7 @@ def run_smc_simulation(config: SMCConfig) -> Dict[str, Any]:
     masses = jnp.concatenate(masses_list)
     
     logger.info(f"System: {system.total_particles} particles, {n_dims} dimensions")
-    logger.info(f"Particles initialized near ORIGIN (spread ~ {spread} Å)")
+    logger.info(f"Particles initialized near density COM (spread ~ {spread} Å)")
     
     timer.stop("3. Initialize coordinates")
     

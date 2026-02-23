@@ -186,7 +186,8 @@ def run_base_smc_rmh(
         return particles[idx], scores[idx], jnp.mean(scores), jnp.std(scores)
 
     # ----- initialise base SMC state ------------------------------------
-    state = smc_base.init(initial_positions)
+    # smc_base.init requires init_update_params; we don't use them so pass {}.
+    state = smc_base.init(initial_positions, {})
 
     if verbose:
         print(f"\nRunning BlackJAX Base SMC (RMH kernel)")
@@ -229,25 +230,26 @@ def run_base_smc_rmh(
             return log_prior_fn(position) + _lam * log_likelihood_fn(position)
 
         # --- update_fn (batched MCMC mutations) --------------------------
-        # Must accept (keys, particles) and return new particles.
-        # We run n_mcmc_steps iterations of RMH each call.
+        # smc_base.step passes (keys, particles, update_params).
+        # Must return (new_particles, update_info).
         @jax.jit
-        def update_fn(keys, particles):
+        def update_fn(keys, particles, update_params):
             def _mutate_one(key, particle):
                 st = blackjax.rmh.init(particle, _tempered_logdensity)
                 def _body(carry, _):
                     k, s = carry
                     k, subk = jax.random.split(k)
-                    s, _ = rmh_kernel(subk, s, _tempered_logdensity, _rmh_proposal)
-                    return (k, s), None
-                (_, final_st), _ = jax.lax.scan(_body, (key, st), jnp.arange(n_mcmc_steps))
-                return final_st.position
-            return jax.vmap(_mutate_one)(keys, particles)
+                    s, info = rmh_kernel(subk, s, _tempered_logdensity, _rmh_proposal)
+                    return (k, s), info.is_accepted
+                (_, final_st), accepted = jax.lax.scan(_body, (key, st), jnp.arange(n_mcmc_steps))
+                return final_st.position, jnp.mean(accepted)
+            new_particles, accept_rates = jax.vmap(_mutate_one)(keys, particles)
+            return new_particles, {"acceptance_rate": accept_rates}
 
-        # --- weigh_fn (batched importance weights) -----------------------
+        # --- weight_fn (batched importance weights) ----------------------
         # Incremental weight = (lambda_t - lambda_{t-1}) * log_likelihood(x)
         @jax.jit
-        def weigh_fn(particles):
+        def weight_fn(particles):
             ll = jax.vmap(log_likelihood_fn)(particles)
             return delta_lam * ll
 
@@ -256,7 +258,7 @@ def run_base_smc_rmh(
             step_key,
             state,
             update_fn,
-            weigh_fn,
+            weight_fn,
             resampling_fn,
         )
         jax.block_until_ready(state.particles)
@@ -363,7 +365,8 @@ def run_base_smc_hmc(
         return particles[idx], scores[idx], jnp.mean(scores), jnp.std(scores)
 
     # ----- initialise base SMC state ------------------------------------
-    state = smc_base.init(initial_positions)
+    # smc_base.init requires init_update_params; we don't use them so pass {}.
+    state = smc_base.init(initial_positions, {})
 
     if verbose:
         print(f"\nRunning BlackJAX Base SMC (HMC kernel)")
@@ -408,27 +411,30 @@ def run_base_smc_hmc(
             return log_prior_fn(position) + _lam * log_likelihood_fn(position)
 
         # --- update_fn (batched HMC mutations) ---------------------------
+        # smc_base.step passes (keys, particles, update_params).
+        # Must return (new_particles, update_info).
         @jax.jit
-        def update_fn(keys, particles):
+        def update_fn(keys, particles, update_params):
             def _mutate_one(key, particle):
                 st = blackjax.hmc.init(particle, _tempered_logdensity)
                 def _body(carry, _):
                     k, s = carry
                     k, subk = jax.random.split(k)
-                    s, _ = hmc_kernel(
+                    s, info = hmc_kernel(
                         subk, s, _tempered_logdensity,
                         hmc_step_size_jnp,
                         hmc_inverse_mass_matrix,
                         hmc_num_integration_steps,
                     )
-                    return (k, s), None
-                (_, final_st), _ = jax.lax.scan(_body, (key, st), jnp.arange(n_mcmc_steps))
-                return final_st.position
-            return jax.vmap(_mutate_one)(keys, particles)
+                    return (k, s), info.is_accepted
+                (_, final_st), accepted = jax.lax.scan(_body, (key, st), jnp.arange(n_mcmc_steps))
+                return final_st.position, jnp.mean(accepted)
+            new_particles, accept_rates = jax.vmap(_mutate_one)(keys, particles)
+            return new_particles, {"acceptance_rate": accept_rates}
 
-        # --- weigh_fn ----------------------------------------------------
+        # --- weight_fn ---------------------------------------------------
         @jax.jit
-        def weigh_fn(particles):
+        def weight_fn(particles):
             ll = jax.vmap(log_likelihood_fn)(particles)
             return delta_lam * ll
 
@@ -437,7 +443,7 @@ def run_base_smc_hmc(
             step_key,
             state,
             update_fn,
-            weigh_fn,
+            weight_fn,
             resampling_fn,
         )
         jax.block_until_ready(state.particles)

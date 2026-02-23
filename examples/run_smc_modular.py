@@ -69,8 +69,8 @@ class SMCConfig:
     kernel: Literal['rmh', 'hmc'] = 'rmh'
     
     # System parameters
-    n_particles: int = 100  # SMC particles
-    random_seed: int = 42
+    n_particles: int = 125  # SMC particles
+    random_seed: int = 41922
     
     # Density map
     mrc_path: str = "output/synthetic_ideal_density.mrc"
@@ -94,15 +94,17 @@ class SMCConfig:
     exvol_stiffness: float = 0.1  # Overlap penalty strength
     
     # Structural restraints (optional)
-    use_structural_restraints: bool = False
-    pair_weight: float = 0.000001
+    use_structural_restraints: bool = True
+    #pair_weight: float = 0.000001
+    #pair_weight: float = 1.0
+    pair_weight: float = 0.0
     
     # SMC parameters
-    n_mcmc_steps: int = 80
+    n_mcmc_steps: int = 90
     target_ess: float = 0.75
     
     # RMH-specific
-    rmh_sigma: float = 4.0  # Proposal step size
+    rmh_sigma: float = 9.0  # Proposal step size
     
     # HMC-specific
     hmc_step_size: float = 0.01
@@ -537,7 +539,7 @@ def run_smc_simulation(config: SMCConfig) -> Dict[str, Any]:
     rng_key = jax.random.PRNGKey(config.random_seed)
     rng_key, init_key = jax.random.split(rng_key)
     
-    spread = 50.0
+    spread = 150.0
     coords = {}
     for ptype in sorted(types_config.keys()):
         n_copies = types_config[ptype]['copy']

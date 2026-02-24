@@ -118,7 +118,7 @@ class BaseSMCConfig:
     n_mcmc_steps: int = 80          # MCMC mutations per temperature step
 
     # RMH-specific
-    rmh_sigma: float = 4.0  # Fixed proposal step size
+    rmh_sigma: float = 8.0  # Fixed proposal step size
 
     # HMC-specific
     hmc_step_size: float = 0.01
@@ -541,7 +541,7 @@ def run_smc_simulation(config: BaseSMCConfig) -> Dict[str, Any]:
     rng_key = jax.random.PRNGKey(config.random_seed)
     rng_key, init_key = jax.random.split(rng_key)
 
-    spread = 50.0
+    spread = 150.0
     coords = {}
     for ptype in sorted(types_config.keys()):
         n_copies = types_config[ptype]['copy']

@@ -97,17 +97,17 @@ class SMCConfig:
     use_structural_restraints: bool = True
     #pair_weight: float = 0.000001
     #pair_weight: float = 1.0
-    pair_weight: float = 0.0
+    pair_weight: float = 1.0
     
     # SMC parameters
     n_mcmc_steps: int = 90
     target_ess: float = 0.75
     
     # RMH-specific
-    rmh_sigma: float = 9.0  # Proposal step size
+    rmh_sigma: float = 5.0  # Proposal step size
     
     # HMC-specific
-    hmc_step_size: float = 0.01
+    hmc_step_size: float = 1.0
     hmc_num_integration_steps: int = 10
     
     # Output

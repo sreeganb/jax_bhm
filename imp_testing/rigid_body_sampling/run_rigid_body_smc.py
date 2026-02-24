@@ -6,7 +6,7 @@ This script:
 1. Creates a multi-protein rigid body system using IMP
 2. Defines JAX-differentiable distance restraints
 3. Runs BlackJAX tempered SMC with RMH mutation kernel
-4. Saves best trajectory as RMF3 file
+4. Saves trajectory as HDF5, then converts to RMF3
 5. Optionally compares with simple RMH sampling
 
 Usage:
@@ -18,7 +18,9 @@ Usage:
 import argparse
 import time
 import os
+import sys
 import numpy as np
+import h5py
 from pathlib import Path
 from typing import Tuple, List, Any, Optional
 from dataclasses import dataclass
@@ -33,8 +35,6 @@ import IMP
 import IMP.atom
 import IMP.core
 import IMP.display
-import IMP.rmf
-import RMF
 
 # Local imports
 from rigid_body_imp_system import (
@@ -46,195 +46,101 @@ from rigid_body_imp_system import (
     set_coordinates_to_model,
 )
 
+# RMF3 converter (uses IMP+RMF internally)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "io_utils"))
+from rmf3_converter import convert_hdf5_to_rmf3, IMP_AVAILABLE as RMF3_AVAILABLE
+
 
 # =============================================================================
-# RMF3 Trajectory Writer
+# HDF5 Trajectory Saver
 # =============================================================================
 
-class RMF3TrajectoryWriter:
-    """
-    Write IMP particle trajectories to RMF3 format.
-    
-    Usage:
-        writer = RMF3TrajectoryWriter("output.rmf3", model, particles)
-        writer.add_frame(coords, score=score, lambda_val=0.5)
-        writer.add_frame(coords2, score=score2, lambda_val=1.0)
-        writer.close()
-    """
-    
-    def __init__(
-        self,
-        filename: str,
-        model: IMP.Model,
-        particles: List,
-        particle_names: Optional[List[str]] = None,
-        color_by_type: Optional[dict] = None,
-    ):
-        """
-        Initialize RMF3 writer.
-        
-        Args:
-            filename: Output RMF3 file path
-            model: IMP Model
-            particles: List of IMP particles to save
-            particle_names: Optional names for particles
-            color_by_type: Dict mapping particle type prefix to RGB tuple
-        """
-        self.filename = filename
-        self.model = model
-        self.particles = particles
-        self.frame_count = 0
-        
-        # Create output directory if needed
-        Path(filename).parent.mkdir(parents=True, exist_ok=True)
-        
-        # Create RMF file
-        self.rmf_file = RMF.create_rmf_file(filename)
-        
-        # Create a simple hierarchy for the particles
-        self.root = IMP.atom.Hierarchy.setup_particle(
-            IMP.Particle(model, "System")
-        )
-        
-        # Add particles to hierarchy with proper decorators
-        self.hierarchies = []
-        for i, p in enumerate(particles):
-            # Get or create name
-            if particle_names:
-                name = particle_names[i]
-            else:
-                name = p.get_name()
-            
-            # Create hierarchy node for this particle
-            h = IMP.atom.Hierarchy(p)
-            if not IMP.atom.Hierarchy.get_is_setup(p):
-                h = IMP.atom.Hierarchy.setup_particle(p)
-            
-            # Ensure XYZR is setup
-            if not IMP.core.XYZR.get_is_setup(p):
-                IMP.core.XYZR.setup_particle(p, IMP.algebra.Sphere3D(
-                    IMP.algebra.Vector3D(0, 0, 0), 1.0
-                ))
-            
-            # Set color if provided
-            if color_by_type:
-                for prefix, color in color_by_type.items():
-                    if name.startswith(prefix):
-                        if not IMP.display.Colored.get_is_setup(p):
-                            IMP.display.Colored.setup_particle(
-                                p, IMP.display.Color(*color)
-                            )
-                        break
-            
-            self.root.add_child(h)
-            self.hierarchies.append(h)
-        
-        # Add hierarchy to RMF
-        IMP.rmf.add_hierarchy(self.rmf_file, self.root)
-        
-        # Add custom keys for score and lambda
-        self.score_key = self.rmf_file.get_root_node().get_file().get_key(
-            RMF.FLOAT, "score", True
-        )
-        self.lambda_key = self.rmf_file.get_root_node().get_file().get_key(
-            RMF.FLOAT, "lambda", True
-        )
-        
-        print(f"RMF3 writer initialized: {filename}")
-    
-    def add_frame(
-        self,
-        coords: np.ndarray,
-        score: Optional[float] = None,
-        lambda_val: Optional[float] = None,
-        frame_name: Optional[str] = None,
-    ):
-        """
-        Add a frame to the trajectory.
-        
-        Args:
-            coords: (N, 3) array of particle coordinates
-            score: Optional log probability score
-            lambda_val: Optional tempering parameter (for SMC)
-            frame_name: Optional name for this frame
-        """
-        # Update particle coordinates in IMP model
-        for i, p in enumerate(self.particles):
-            xyz = IMP.core.XYZ(p)
-            xyz.set_coordinates(IMP.algebra.Vector3D(
-                float(coords[i, 0]),
-                float(coords[i, 1]),
-                float(coords[i, 2]),
-            ))
-        
-        # Create new frame
-        if frame_name:
-            frame_id = self.rmf_file.add_frame(frame_name)
-        else:
-            frame_id = self.rmf_file.add_frame(f"frame_{self.frame_count}")
-        
-        # Save coordinates to RMF
-        IMP.rmf.save_frame(self.rmf_file)
-        
-        # Add score and lambda as frame attributes if provided
-        root_node = self.rmf_file.get_root_node()
-        if score is not None:
-            try:
-                root_node.set_value(self.score_key, float(score))
-            except:
-                pass  # Some RMF versions handle this differently
-        
-        if lambda_val is not None:
-            try:
-                root_node.set_value(self.lambda_key, float(lambda_val))
-            except:
-                pass
-        
-        self.frame_count += 1
-    
-    def close(self):
-        """Close the RMF file."""
-        del self.rmf_file
-        print(f"RMF3 trajectory saved: {self.filename} ({self.frame_count} frames)")
-
-
-def save_trajectory_to_rmf3(
+def save_trajectory_to_hdf5(
     filename: str,
-    model: IMP.Model,
-    particles: List,
     trajectory: np.ndarray,
-    scores: Optional[np.ndarray] = None,
+    scores: np.ndarray,
+    particle_names: List[str],
+    rb_configs: List[RigidBodyConfig],
     lambdas: Optional[np.ndarray] = None,
-    particle_names: Optional[List[str]] = None,
-    color_by_type: Optional[dict] = None,
+    metadata: Optional[dict] = None,
 ):
     """
-    Save a complete trajectory to RMF3 file.
-    
+    Save trajectory coordinates to HDF5 in the format expected by rmf3_converter.
+
+    Expected output layout:
+      - coordinates/{type_name}: (n_frames, n_copies, 3)
+      - log_probabilities: (n_frames,)
+      - system_info/: group with radii, type info, metadata
+
     Args:
-        filename: Output RMF3 file path
-        model: IMP Model
-        particles: List of IMP particles
+        filename: Output HDF5 file path
         trajectory: (n_frames, n_particles, 3) coordinate array
-        scores: Optional (n_frames,) array of scores
-        lambdas: Optional (n_frames,) array of lambda values
-        particle_names: Optional list of particle names
-        color_by_type: Dict mapping type prefix to RGB color
+        scores: (n_frames,) array of log probabilities
+        particle_names: List of particle name strings (e.g. ['A_0', 'A_1', 'B_0', ...])
+        rb_configs: List of RigidBodyConfig used to create the system
+        lambdas: Optional (n_frames,) array of tempering lambda values
+        metadata: Optional dict of extra metadata
     """
-    writer = RMF3TrajectoryWriter(
-        filename, model, particles, particle_names, color_by_type
-    )
-    
-    n_frames = trajectory.shape[0]
-    
-    for i in range(n_frames):
-        coords = trajectory[i]
-        score = float(scores[i]) if scores is not None else None
-        lambda_val = float(lambdas[i]) if lambdas is not None else None
-        
-        writer.add_frame(coords, score=score, lambda_val=lambda_val)
-    
-    writer.close()
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
+
+    n_frames, n_particles, _ = trajectory.shape
+
+    # Group particle indices by type prefix (e.g. "A", "B", "C")
+    # particle_names look like "A_0", "A_1", "B_0", etc.
+    type_to_indices = {}
+    for i, name in enumerate(particle_names):
+        # Type prefix is everything before the last '_'
+        type_prefix = name.rsplit('_', 1)[0]
+        type_to_indices.setdefault(type_prefix, []).append(i)
+
+    # Build radii lookup from rb_configs
+    radii_map = {cfg.name: cfg.radius for cfg in rb_configs}
+
+    print(f"Saving trajectory to HDF5: {filename}")
+    print(f"  Frames: {n_frames}, Particles: {n_particles}")
+
+    with h5py.File(filename, 'w') as f:
+        # --- coordinates group: one dataset per type ---
+        coords_grp = f.create_group('coordinates')
+        for type_name in sorted(type_to_indices.keys()):
+            indices = type_to_indices[type_name]
+            # Shape: (n_frames, n_copies, 3)
+            type_coords = trajectory[:, indices, :]
+            coords_grp.create_dataset(type_name, data=type_coords)
+            print(f"    {type_name}: {type_coords.shape} "
+                  f"(radius={radii_map.get(type_name, 'N/A')})")
+
+        # --- log probabilities ---
+        f.create_dataset('log_probabilities', data=scores)
+
+        # --- lambda schedule (if SMC) ---
+        if lambdas is not None:
+            f.create_dataset('lambda_schedule', data=lambdas)
+
+        # --- system_info group ---
+        sys_grp = f.create_group('system_info')
+        sys_grp.attrs['n_frames'] = n_frames
+        sys_grp.attrs['n_particles'] = n_particles
+        sys_grp.attrs['particle_types'] = list(sorted(type_to_indices.keys()))
+
+        # Store radii
+        for type_name, r in radii_map.items():
+            sys_grp.attrs[f"{type_name}_radius"] = float(r)
+
+        # Store copy counts
+        for type_name, indices in type_to_indices.items():
+            sys_grp.attrs[f"{type_name}_n_copies"] = len(indices)
+
+        # Store extra metadata
+        if metadata is not None:
+            for key, val in metadata.items():
+                try:
+                    sys_grp.attrs[key] = val
+                except TypeError:
+                    sys_grp.attrs[key] = str(val)
+
+    print(f"  Saved: {filename}")
+    return filename
 
 
 # =============================================================================
@@ -630,7 +536,7 @@ def run_simulation(config: RunConfig):
             'acceptance_rate': float(acc_rate),
             'final_score': float(scores[-1]),
             'score_trajectory': np.array(scores),
-            'samples': np.array(samples),  # Keep all samples for RMF3
+            'samples': np.array(samples),  # Keep all samples
         }
     
     else:
@@ -662,19 +568,16 @@ def run_simulation(config: RunConfig):
     results['rigid_bodies'] = rigid_bodies
     
     # =========================================================================
-    # 6. Save RMF3 trajectory
+    # 6. Save trajectory to HDF5, then convert to RMF3
     # =========================================================================
     if config.save_rmf3:
-        print(f"\n[5] Saving RMF3 trajectory...")
+        print(f"\n[5] Saving trajectory...")
         
         # Create output directory
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Generate filename
-        rmf3_filename = output_dir / f"{config.output_prefix}_{config.method}.rmf3"
-        
-        # Get particle names for coloring
+        # Get particle names for type grouping
         particle_names = [p.get_name() for p in info['particles']]
         
         # Color scheme by particle type
@@ -684,55 +587,92 @@ def run_simulation(config: RunConfig):
             'C': (0.3, 0.8, 0.4),   # Green
         }
         
+        # Build trajectory array: (n_frames, n_particles, 3)
+        lambdas = None
+        
         if config.method == 'smc':
-            # For SMC: save best particle at each temperature step
+            # For SMC: best particle at each temperature step
             trajectory = results['best_trajectory'].reshape(-1, n_particles, 3)
-            scores = results['score_trajectory']
-            
-            # Compute lambda values for each frame
-            # Frame 0 is initial (lambda=0), last frame is lambda=1
-            n_frames = len(scores)
+            scores_arr = results['score_trajectory']
+            n_frames = len(scores_arr)
             lambdas = np.linspace(0, 1, n_frames)
             
-            save_trajectory_to_rmf3(
-                str(rmf3_filename),
-                model,
-                info['particles'],
-                trajectory,
-                scores=scores,
-                lambdas=lambdas,
-                particle_names=particle_names,
-                color_by_type=color_by_type,
-            )
-            
         else:  # RMH
-            # For RMH: save samples at intervals
             all_samples = results.get('samples', None)
             all_scores = results['score_trajectory']
             
             if all_samples is None:
-                # If we don't have all samples, just save final state
                 trajectory = results['best_position'].reshape(1, n_particles, 3)
-                scores = np.array([results['best_score']])
+                scores_arr = np.array([results['best_score']])
             else:
-                # Save at intervals
+                # Subsample at save_interval
                 interval = config.save_interval
                 indices = list(range(0, len(all_scores), interval))
                 trajectory = all_samples[indices].reshape(-1, n_particles, 3)
-                scores = all_scores[indices]
-            
-            save_trajectory_to_rmf3(
-                str(rmf3_filename),
-                model,
-                info['particles'],
-                trajectory,
-                scores=scores,
-                particle_names=particle_names,
-                color_by_type=color_by_type,
-            )
+                scores_arr = all_scores[indices]
         
-        results['rmf3_file'] = str(rmf3_filename)
-        print(f"  Saved: {rmf3_filename}")
+        # Metadata
+        metadata = {
+            'method': config.method,
+            'initial_score': initial_score,
+            'best_score': results['best_score'],
+            'rmh_sigma': config.rmh_sigma,
+            'seed': config.seed,
+            'box_size': config.box_size,
+            'target_distance': config.target_distance,
+            'distance_k': config.distance_k,
+            'exvol_k': config.exvol_k,
+        }
+        if config.method == 'smc':
+            metadata['n_smc_particles'] = config.n_smc_particles
+            metadata['n_mcmc_steps'] = config.n_mcmc_steps
+            metadata['target_ess'] = config.target_ess
+            metadata['n_temp_steps'] = results['n_temp_steps']
+        else:
+            metadata['n_rmh_steps'] = config.n_rmh_steps
+            metadata['acceptance_rate'] = results.get('acceptance_rate', 0.0)
+            metadata['save_interval'] = config.save_interval
+        
+        # --- Step 1: Save to HDF5 ---
+        hdf5_filename = output_dir / f"{config.output_prefix}_{config.method}.h5"
+        
+        save_trajectory_to_hdf5(
+            filename=str(hdf5_filename),
+            trajectory=trajectory,
+            scores=scores_arr,
+            particle_names=particle_names,
+            rb_configs=rb_configs,
+            lambdas=lambdas,
+            metadata=metadata,
+        )
+        
+        results['hdf5_file'] = str(hdf5_filename)
+        
+        # --- Step 2: Convert HDF5 to RMF3 ---
+        rmf3_filename = output_dir / f"{config.output_prefix}_{config.method}.rmf3"
+        
+        if RMF3_AVAILABLE:
+            print(f"\n[6] Converting HDF5 to RMF3...")
+            try:
+                convert_hdf5_to_rmf3(
+                    hdf5_file=str(hdf5_filename),
+                    rmf3_file=str(rmf3_filename),
+                    radius=1.0,  # fallback; per-type radii are in h5
+                    color_map=color_by_type,
+                )
+                results['rmf3_file'] = str(rmf3_filename)
+            except Exception as e:
+                print(f"  WARNING: RMF3 conversion failed: {e}")
+                print(f"  HDF5 trajectory is still available: {hdf5_filename}")
+                print(f"  You can convert manually later:")
+                print(f"    python -c \"from rmf3_converter import convert_hdf5_to_rmf3; "
+                      f"convert_hdf5_to_rmf3('{hdf5_filename}', '{rmf3_filename}')\"")
+        else:
+            print(f"\n[6] RMF3 conversion skipped (IMP/RMF not available for converter)")
+            print(f"  HDF5 saved: {hdf5_filename}")
+            print(f"  Convert later with:")
+            print(f"    python -c \"from rmf3_converter import convert_hdf5_to_rmf3; "
+                  f"convert_hdf5_to_rmf3('{hdf5_filename}', '{rmf3_filename}')\"")
     
     return results
 
@@ -822,7 +762,9 @@ def main():
     
     print("\n✓ Simulation complete!")
     if 'rmf3_file' in results:
-        print(f"  Trajectory: {results['rmf3_file']}")
+        print(f"  Trajectory (RMF3): {results['rmf3_file']}")
+    if 'hdf5_file' in results:
+        print(f"  Trajectory (HDF5): {results['hdf5_file']}")
     
     return results
 

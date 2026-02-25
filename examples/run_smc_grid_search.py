@@ -14,7 +14,7 @@ Features
 Default sweep specification
 ---------------------------
 RMH:
-- rmh_sigma: 1.0 .. 10.0 (step 2.0)
+- rmh_sigma: 1.0 .. 10.0 (step 3.0)
 - n_mcmc_steps: 5 .. 55 (step 10)
 - n_particles: 40 .. 100 (step 10)
 
@@ -69,9 +69,10 @@ def _float_token(value: float) -> str:
 
 def _rmh_jobs() -> List[JobSpec]:
     jobs: List[JobSpec] = []
-    for n_mcmc_steps in range(5, 56, 10):
-        for n_particles in range(40, 101, 10):
-            for rmh_sigma in range(1, 11, 2):
+    # Coarser grid
+    for n_mcmc_steps in range(5, 100, 20):      # 5,25,45,65,85  (5)
+        for n_particles in range(40, 101, 20):  # 40,60,80,100        (4)
+            for rmh_sigma in (1.0, 4.0, 7.0, 10.0):  # (4)
                 run_name = (
                     f"rmh_np{n_particles:03d}_nm{n_mcmc_steps:03d}_"
                     f"sig{_float_token(float(rmh_sigma))}"
@@ -90,10 +91,11 @@ def _rmh_jobs() -> List[JobSpec]:
 
 def _hmc_jobs() -> List[JobSpec]:
     jobs: List[JobSpec] = []
-    hmc_step_sizes = [0.1 * (i + 1) for i in range(8)]  # 0.1, 0.2, ..., 0.8
-    for n_mcmc_steps in range(5, 56, 10):
-        for n_particles in range(40, 101, 10):
-            for hmc_L in range(5, 21, 5):
+    # Coarser grid
+    hmc_step_sizes = [0.1, 0.25, 0.5, 0.75, 0.9]  # (5)
+    for n_mcmc_steps in range(10, 80, 20):        # 10, 30, 50, 70  (4)
+        for n_particles in range(40, 101, 20):    # 40, 60, 80, 100  (4)
+            for hmc_L in range(5, 21, 5):         # 5, 10, 15  (4)
                 for hmc_step_size in hmc_step_sizes:
                     run_name = (
                         f"hmc_np{n_particles:03d}_nm{n_mcmc_steps:03d}_"

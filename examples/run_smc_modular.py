@@ -74,7 +74,7 @@ class SMCConfig:
     
     # Density map
     mrc_path: str = "output/synthetic_ideal_density.mrc"
-    resolution: float = 50.0
+    resolution: float = 30.0
     voxel_size: float = 3.0
     
     # Grid setup (will be computed from map or specified)
@@ -83,32 +83,32 @@ class SMCConfig:
     
     # CCC likelihood parameters
     likelihood_type: Literal['gaussian', 'laplace', 'cauchy'] = 'gaussian'
-    sigma_ccc: float = 0.1  # Width of likelihood on (1-CCC)
+    sigma_ccc: float = 0.05  # Width of likelihood on (1-CCC)
     
     # Prior parameters
     box_size: float = 300.0  # Bounding box size
-    box_steepness: float = 10.0  # Soft box penalty strength
+    box_steepness: float = 0.1  # Soft box penalty strength
     slope_factor: float = 0.001  # Attraction to density COM
     
     # Excluded volume
     exvol_stiffness: float = 0.1  # Overlap penalty strength
     
     # Structural restraints (optional)
-    use_structural_restraints: bool = True
+    use_structural_restraints: bool = False  # Whether to include structural restraints in likelihood
     #pair_weight: float = 0.000001
     #pair_weight: float = 1.0
-    pair_weight: float = 1.0
+    pair_weight: float = 0.0
     
     # SMC parameters
-    n_mcmc_steps: int = 90
+    n_mcmc_steps: int = 50
     target_ess: float = 0.75
     
     # RMH-specific
-    rmh_sigma: float = 5.0  # Proposal step size
+    rmh_sigma: float = 4.0  # Proposal step size
     
     # HMC-specific
-    hmc_step_size: float = 1.0
-    hmc_num_integration_steps: int = 10
+    hmc_step_size: float = 0.5
+    hmc_num_integration_steps: int = 20
     
     # Output
     output_dir: str = "output_smc"
@@ -855,6 +855,15 @@ def parse_args():
                        help='Soft box penalty strength')
     parser.add_argument('--slope_factor', type=float, default=0.01,
                        help='Attraction to density COM')
+    parser.add_argument('--exvol_stiffness', type=float, default=0.1,
+                       help='Excluded-volume stiffness for overlap penalty')
+    parser.add_argument('--pair_weight', type=float, default=1.0,
+                       help='Pair/structural restraint weight (used only when structural restraints are enabled)')
+    parser.add_argument('--use_structural_restraints', dest='use_structural_restraints', action='store_true',
+                       help='Enable structural restraints in the likelihood')
+    parser.add_argument('--disable_structural_restraints', dest='use_structural_restraints', action='store_false',
+                       help='Disable structural restraints in the likelihood')
+    parser.set_defaults(use_structural_restraints=None)
     
     # SMC
     parser.add_argument('--n_mcmc_steps', type=int, default=50,
@@ -888,6 +897,12 @@ def main():
     args = parse_args()
     
     print(f"JAX default backend: {jax.default_backend()}")
+
+    use_structural_restraints = (
+        SMCConfig().use_structural_restraints
+        if args.use_structural_restraints is None
+        else args.use_structural_restraints
+    )
     
     config = SMCConfig(
         kernel=args.kernel,
@@ -900,6 +915,9 @@ def main():
         box_size=args.box_size,
         box_steepness=args.box_steepness,
         slope_factor=args.slope_factor,
+        exvol_stiffness=args.exvol_stiffness,
+        pair_weight=args.pair_weight,
+        use_structural_restraints=use_structural_restraints,
         n_mcmc_steps=args.n_mcmc_steps,
         target_ess=args.target_ess,
         rmh_sigma=args.rmh_sigma,

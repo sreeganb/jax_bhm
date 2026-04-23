@@ -846,7 +846,7 @@ def parse_args():
     # System
     parser.add_argument('--n_particles', type=int, default=50,
                         help='Number of SMC particles')
-    parser.add_argument('--seed', type=int, default=42,
+    parser.add_argument('--seed', type=int, default=1827,
                         help='Random seed')
 
     # Density map
@@ -866,11 +866,11 @@ def parse_args():
                         help='Bounding box size in Angstroms')
     parser.add_argument('--box_steepness', type=float, default=10.0,
                         help='Soft box penalty strength')
-    parser.add_argument('--slope_factor', type=float, default=0.01,
+    parser.add_argument('--slope_factor', type=float, default=0.001,
                         help='Attraction to density COM')
 
     # Base SMC specific
-    parser.add_argument('--n_temperature_steps', type=int, default=20,
+    parser.add_argument('--n_temperature_steps', type=int, default=500,
                         help='Number of fixed temperature steps (lambda from 0 to 1)')
     parser.add_argument('--schedule', type=str, choices=['linear', 'geometric', 'sigmoid'],
                         default='linear', help='Temperature schedule type')
@@ -878,7 +878,7 @@ def parse_args():
                         help='MCMC mutation steps per temperature')
 
     # RMH specific
-    parser.add_argument('--rmh_sigma', type=float, default=3.0,
+    parser.add_argument('--rmh_sigma', type=float, default=4.0,
                         help='RMH proposal step size (fixed)')
 
     # HMC specific

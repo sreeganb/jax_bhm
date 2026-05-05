@@ -1,5 +1,5 @@
 """
-sampling/imp_blackjax_adapter.py
+sampling/wrapper_imp_blackjax.py
 ================================
 
 Adapter that lets IMP's *structured* JAX model (a dict with ``'xyz'``,

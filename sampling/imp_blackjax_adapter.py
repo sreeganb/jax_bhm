@@ -97,6 +97,127 @@ def _normalise_quat(q: jnp.ndarray) -> jnp.ndarray:
     return q / (jnp.linalg.norm(q) + 1e-12)
 
 
+def _extract_particle_indices_from_ji(ji, jm_initial: dict) -> Optional[List[int]]:
+    """Try IMP/JAX API variants to get xyz-row -> IMP-particle index mapping."""
+    candidate_methods = [
+        "get_particle_indices",
+        "get_particle_indexes",
+    ]
+    for method_name in candidate_methods:
+        method = getattr(ji, method_name, None)
+        if callable(method):
+            values = list(method())
+            if values:
+                return [int(v) for v in values]
+
+    candidate_attrs = [
+        "particle_indices",
+        "particle_indexes",
+        "particle_index",
+    ]
+    for attr_name in candidate_attrs:
+        if hasattr(ji, attr_name):
+            values = getattr(ji, attr_name)
+            try:
+                values = list(values)
+            except TypeError:
+                continue
+            if values:
+                return [int(v) for v in values]
+
+    candidate_jm_keys = [
+        "particle_indices",
+        "particle_indexes",
+        "particle_index",
+        "indexes",
+        "indices",
+    ]
+    n_xyz = int(np.asarray(jm_initial["xyz"]).shape[0])
+    for key in candidate_jm_keys:
+        if key not in jm_initial:
+            continue
+        values = np.asarray(jm_initial[key]).reshape(-1)
+        if values.shape[0] != n_xyz:
+            continue
+        if not np.issubdtype(values.dtype, np.integer):
+            continue
+        return [int(v) for v in values.tolist()]
+
+    return None
+
+
+def _build_particle_index_map_by_coordinates(
+    dof: IMP.pmi.dof.DegreesOfFreedom,
+    base_xyz: np.ndarray,
+) -> Dict[int, int]:
+    """
+    Coordinate-based fallback when IMP/JAX does not expose particle indices.
+
+    Matches only particles controlled by the DOF movers (RB + Ball). This is
+    sufficient for mapping all parameters in the adapter.
+    """
+    pid_to_particle = {}
+
+    for mover in dof.get_movers():
+        if isinstance(mover, IMP.core.RigidBodyMover):
+            rb = IMP.core.RigidBody(mover.get_rigid_body())
+            for leaf in IMP.core.get_leaves(rb.get_rigid_body_as_hierarchy()):
+                pid_to_particle[int(leaf.get_index())] = leaf
+        elif isinstance(mover, IMP.core.BallMover):
+            for p in mover.get_particles():
+                pid_to_particle[int(p.get_index())] = p
+
+    if not pid_to_particle:
+        return {}
+
+    rounded_to_indices: Dict[Tuple[float, float, float], List[int]] = {}
+    for jax_idx, xyz in enumerate(base_xyz):
+        key = (round(float(xyz[0]), 6), round(float(xyz[1]), 6), round(float(xyz[2]), 6))
+        rounded_to_indices.setdefault(key, []).append(jax_idx)
+
+    pid_to_jax: Dict[int, int] = {}
+    used_indices: set = set()
+
+    for pid, particle in pid_to_particle.items():
+        xyz = np.asarray(IMP.core.XYZ(particle).get_coordinates(), dtype=float)
+        key = (round(float(xyz[0]), 6), round(float(xyz[1]), 6), round(float(xyz[2]), 6))
+
+        candidates = rounded_to_indices.get(key, [])
+        assigned = None
+        while candidates:
+            idx = candidates.pop()
+            if idx not in used_indices:
+                assigned = idx
+                break
+
+        if assigned is None:
+            available = np.array(
+                [i for i in range(base_xyz.shape[0]) if i not in used_indices],
+                dtype=np.int32,
+            )
+            if available.size == 0:
+                raise RuntimeError(
+                    "Failed to map IMP particle indices to JAX xyz rows: no rows left."
+                )
+            deltas = base_xyz[available] - xyz[None, :]
+            d2 = np.sum(deltas * deltas, axis=1)
+            best_local = int(np.argmin(d2))
+            best_d2 = float(d2[best_local])
+            assigned = int(available[best_local])
+            if best_d2 > 1e-6:
+                raise RuntimeError(
+                    "Failed to infer particle-index mapping from coordinates; "
+                    f"min squared distance={best_d2:.3e}. "
+                    "Please use an IMP build exposing get_particle_indices() or "
+                    "provide particle indices in ji/jm."
+                )
+
+        pid_to_jax[pid] = assigned
+        used_indices.add(assigned)
+
+    return pid_to_jax
+
+
 def _extract_rb_info(dof: IMP.pmi.dof.DegreesOfFreedom,
                      base_xyz: np.ndarray,
                      particle_index_map: Dict[int, int],
@@ -201,11 +322,15 @@ class IMPDOFSpace:
         """
         base_xyz = np.array(jm_initial["xyz"])  # (N, 3)
 
-        # Build particle-id → jax-index map.
-        # ji.get_particle_indices() returns the IMP particle indices
-        # in the same order as the xyz rows.
-        imp_particle_indices: List[int] = list(ji.get_particle_indices())
-        pid_to_jax = {pid: jax_idx for jax_idx, pid in enumerate(imp_particle_indices)}
+        # Build particle-id -> jax-index map with IMP API compatibility.
+        imp_particle_indices = _extract_particle_indices_from_ji(ji, jm_initial)
+        if imp_particle_indices is not None:
+            pid_to_jax = {
+                int(pid): int(jax_idx)
+                for jax_idx, pid in enumerate(imp_particle_indices)
+            }
+        else:
+            pid_to_jax = _build_particle_index_map_by_coordinates(dof, base_xyz)
 
         rb_descriptors, handled, dof_offset = _extract_rb_info(
             dof, base_xyz, pid_to_jax

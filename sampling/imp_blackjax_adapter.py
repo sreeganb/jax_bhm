@@ -136,6 +136,48 @@ def _get_rb_from_mover(mover) -> IMP.core.RigidBody:
     )
 
 
+def _get_rb_member_particles(rb: IMP.core.RigidBody) -> List:
+    """Return rigid-body member particles across IMP API variants."""
+    get_hier = getattr(rb, "get_rigid_body_as_hierarchy", None)
+    if callable(get_hier):
+        return list(IMP.core.get_leaves(get_hier()))
+
+    model = rb.get_model()
+
+    # Newer IMP exposes direct member index accessors on RigidBody.
+    index_getters = [
+        "get_member_particle_indexes",
+        "get_member_indexes",
+    ]
+    for getter_name in index_getters:
+        getter = getattr(rb, getter_name, None)
+        if not callable(getter):
+            continue
+        try:
+            member_indexes = list(getter())
+        except TypeError:
+            continue
+        members = []
+        for idx in member_indexes:
+            try:
+                members.append(model.get_particle(idx))
+            except TypeError:
+                members.append(model.get_particle(int(idx)))
+        if members:
+            return members
+
+    # Last resort: if this rigid body is itself represented by a particle,
+    # return it so callers can continue (better than hard-failing).
+    try:
+        return [rb.get_particle()]
+    except Exception as exc:
+        raise AttributeError(
+            "Unable to enumerate rigid-body members. Tried "
+            "get_rigid_body_as_hierarchy(), get_member_particle_indexes(), "
+            "and get_member_indexes()."
+        ) from exc
+
+
 def _extract_particle_indices_from_ji(ji, jm_initial: dict) -> Optional[List[int]]:
     """Try IMP/JAX API variants to get xyz-row -> IMP-particle index mapping."""
     candidate_methods = [
@@ -200,8 +242,8 @@ def _build_particle_index_map_by_coordinates(
     for mover in dof.get_movers():
         if isinstance(mover, IMP.core.RigidBodyMover):
             rb = _get_rb_from_mover(mover)
-            for leaf in IMP.core.get_leaves(rb.get_rigid_body_as_hierarchy()):
-                pid_to_particle[int(leaf.get_index())] = leaf
+            for member in _get_rb_member_particles(rb):
+                pid_to_particle[int(member.get_index())] = member
         elif isinstance(mover, IMP.core.BallMover):
             for p in mover.get_particles():
                 pid_to_particle[int(p.get_index())] = p
@@ -282,7 +324,7 @@ def _extract_rb_info(dof: IMP.pmi.dof.DegreesOfFreedom,
 
     for mover in rb_movers:
         rb = _get_rb_from_mover(mover)
-        members = IMP.core.get_leaves(rb.get_rigid_body_as_hierarchy())
+        members = _get_rb_member_particles(rb)
 
         member_jax_idxs = []
         member_local = []

@@ -527,8 +527,10 @@ class IMPSMCAdapter:
 
         # Pre-compute static arrays for JAX (no Python loops at score time).
         # Rigid-body member data
-        self._rb_offsets = jnp.array(
-            [rb["dof_offset"] for rb in dof_space.rb_descriptors], dtype=jnp.int32
+        # Keep offsets as plain Python ints so JAX sees slice bounds as static
+        # inside jitted functions (flat[o:o+3], etc.).
+        self._rb_offsets = tuple(
+            int(rb["dof_offset"]) for rb in dof_space.rb_descriptors
         )
         self._rb_member_indices = [
             jnp.array(rb["member_jax_indices"], dtype=jnp.int32)
@@ -541,7 +543,7 @@ class IMPSMCAdapter:
 
         # Flexible bead indices
         self._fb_indices = jnp.array(dof_space.fb_jax_indices, dtype=jnp.int32)
-        self._fb_dof_offset = dof_space.fb_dof_offset
+        self._fb_dof_offset = int(dof_space.fb_dof_offset)
 
         self._jax_score_func = jax_score_func
         self._build_jax_fns()

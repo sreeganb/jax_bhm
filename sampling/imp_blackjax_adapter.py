@@ -105,13 +105,34 @@ def _get_rb_from_mover(mover) -> IMP.core.RigidBody:
 
     get_index = getattr(mover, "get_index", None)
     if callable(get_index):
-        pi = int(get_index())
+        pi_obj = get_index()
         model = mover.get_model()
-        return IMP.core.RigidBody(model, pi)
+
+        # Newer IMP Python bindings may expose ParticleIndex as a distinct
+        # wrapped type that does not always match the (Model, int) overload.
+        try:
+            return IMP.core.RigidBody(model, pi_obj)
+        except TypeError:
+            pass
+
+        try:
+            return IMP.core.RigidBody(model, int(pi_obj))
+        except (TypeError, ValueError):
+            pass
+
+        get_particle = getattr(model, "get_particle", None)
+        if callable(get_particle):
+            try:
+                return IMP.core.RigidBody(get_particle(pi_obj))
+            except TypeError:
+                try:
+                    return IMP.core.RigidBody(get_particle(int(pi_obj)))
+                except (TypeError, ValueError):
+                    pass
 
     raise AttributeError(
-        "RigidBodyMover does not expose get_rigid_body() or get_index(); "
-        "cannot recover rigid body."
+        "Unable to recover rigid body from mover. Tried get_rigid_body(), "
+        "get_index() with (model, index), and model.get_particle(index)."
     )
 
 

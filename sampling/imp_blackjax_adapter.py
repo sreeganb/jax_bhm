@@ -178,6 +178,28 @@ def _get_rb_member_particles(rb: IMP.core.RigidBody) -> List:
         ) from exc
 
 
+def _get_ball_mover_particles(mover) -> List:
+    """Return BallMover particles across IMP API variants."""
+    get_particles = getattr(mover, "get_particles", None)
+    if callable(get_particles):
+        return list(get_particles())
+
+    get_indexes = getattr(mover, "get_indexes", None)
+    if callable(get_indexes):
+        model = mover.get_model()
+        particles = []
+        for idx in get_indexes():
+            try:
+                particles.append(model.get_particle(idx))
+            except TypeError:
+                particles.append(model.get_particle(int(idx)))
+        return particles
+
+    raise AttributeError(
+        "BallMover does not expose get_particles() or get_indexes()."
+    )
+
+
 def _extract_particle_indices_from_ji(ji, jm_initial: dict) -> Optional[List[int]]:
     """Try IMP/JAX API variants to get xyz-row -> IMP-particle index mapping."""
     candidate_methods = [
@@ -245,7 +267,7 @@ def _build_particle_index_map_by_coordinates(
             for member in _get_rb_member_particles(rb):
                 pid_to_particle[int(member.get_index())] = member
         elif isinstance(mover, IMP.core.BallMover):
-            for p in mover.get_particles():
+            for p in _get_ball_mover_particles(mover):
                 pid_to_particle[int(p.get_index())] = p
 
     if not pid_to_particle:
@@ -422,7 +444,7 @@ class IMPDOFSpace:
         fb_movers = [m for m in dof.get_movers()
                      if isinstance(m, IMP.core.BallMover)]
         for mover in fb_movers:
-            for p in mover.get_particles():
+            for p in _get_ball_mover_particles(mover):
                 pid = p.get_index()
                 if pid in pid_to_jax:
                     jax_idx = pid_to_jax[pid]

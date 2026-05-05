@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 *.rmf3
 *.h5
+*.mrc
+*.db
+*.pdf
 
 # C extensions
 *.so

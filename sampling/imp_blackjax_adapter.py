@@ -650,11 +650,12 @@ class IMPSMCAdapter:
         Given a flat DOF vector, return the full particle xyz array
         as a numpy array of shape (N, 3).
         """
-        return np.array(self._flat_to_xyz(flat))
+        return np.asarray(jax.device_get(self._flat_to_xyz(flat)))
 
     def imp_score(self, flat: jnp.ndarray) -> float:
         """Return the raw IMP energy for a flat DOF vector."""
-        return float(self._score_jit(flat))
+        score = jax.device_get(self._score_jit(flat))
+        return float(score)
 
     def sample_prior(
         self,

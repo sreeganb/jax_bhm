@@ -97,6 +97,24 @@ def _normalise_quat(q: jnp.ndarray) -> jnp.ndarray:
     return q / (jnp.linalg.norm(q) + 1e-12)
 
 
+def _get_rb_from_mover(mover) -> IMP.core.RigidBody:
+    """Return an IMP.core.RigidBody from old/new RigidBodyMover APIs."""
+    get_rb = getattr(mover, "get_rigid_body", None)
+    if callable(get_rb):
+        return IMP.core.RigidBody(get_rb())
+
+    get_index = getattr(mover, "get_index", None)
+    if callable(get_index):
+        pi = int(get_index())
+        model = mover.get_model()
+        return IMP.core.RigidBody(model, pi)
+
+    raise AttributeError(
+        "RigidBodyMover does not expose get_rigid_body() or get_index(); "
+        "cannot recover rigid body."
+    )
+
+
 def _extract_particle_indices_from_ji(ji, jm_initial: dict) -> Optional[List[int]]:
     """Try IMP/JAX API variants to get xyz-row -> IMP-particle index mapping."""
     candidate_methods = [
@@ -160,7 +178,7 @@ def _build_particle_index_map_by_coordinates(
 
     for mover in dof.get_movers():
         if isinstance(mover, IMP.core.RigidBodyMover):
-            rb = IMP.core.RigidBody(mover.get_rigid_body())
+            rb = _get_rb_from_mover(mover)
             for leaf in IMP.core.get_leaves(rb.get_rigid_body_as_hierarchy()):
                 pid_to_particle[int(leaf.get_index())] = leaf
         elif isinstance(mover, IMP.core.BallMover):
@@ -242,7 +260,7 @@ def _extract_rb_info(dof: IMP.pmi.dof.DegreesOfFreedom,
                  if isinstance(m, IMP.core.RigidBodyMover)]
 
     for mover in rb_movers:
-        rb = IMP.core.RigidBody(mover.get_rigid_body())
+        rb = _get_rb_from_mover(mover)
         members = IMP.core.get_leaves(rb.get_rigid_body_as_hierarchy())
 
         member_jax_idxs = []

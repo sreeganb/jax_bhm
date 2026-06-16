@@ -96,7 +96,13 @@ dr1 = IMP.core.DistanceRestraint(model, ts1, particle_1[0], particle_2[0])
 IMP.pmi.tools.shuffle_configuration(root_hier,
                                     max_translation=500,
                                     avoidcollision_rb=False,
-                                    bounding_box=((-400, -400, -400), (400, 400, 0)))
+                                    bounding_box=((-100, -100, 0), (100, 100, 100)))
+
+
+# Set up RMF output
+output = IMP.pmi.output.Output()
+output.init_rmf("shuffled_particles.rmf3", [root_hier])  # Initialize the RMF file
+output.write_rmf("shuffled_particles.rmf3")  # Write the RMF file
 
 sf_imp = IMP.core.RestraintsScoringFunction(dr1)
 score = sf_imp.evaluate(False)
@@ -108,9 +114,3 @@ jmodel = ji.get_jax_model()
 print("Initial JAX score:", jax_score_func(jmodel))
 print("Initial IMP score:", score)
 print("jax model:", jmodel)
-
-# Set up RMF output
-output = IMP.pmi.output.Output()
-output.init_rmf("shuffled_particles.rmf3", [root_hier])  # Initialize the RMF file
-output.write_rmf("shuffled_particles.rmf3")  # Write the RMF file
-output.close_rmf("shuffled_particles.rmf3")

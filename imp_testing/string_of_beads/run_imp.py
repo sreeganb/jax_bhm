@@ -71,3 +71,46 @@ for mol_names in molecules:
         print(f"Added connectivity restraint for molecule: {mol.get_name()}")
         print(cr)
         output_objects.append(cr)
+        
+# Add in some JAX based distance restraints between some specific residues
+# Apparently the PMI based distance restraint has a JAX implementation,
+# so lets test this
+tuple_1 = (1, 1, "KCOIL")
+tuple_2 = (1, 1, "ECOIL")
+distance_max = 10.0  # example distance
+kappa = 40.0
+ts1 = IMP.core.HarmonicUpperBound(distance_max, kappa)
+
+sel1 = IMP.atom.Selection(root_hier, resolution=1, molecule=tuple_1[2],
+                          residue_index=tuple_1[0], copy_index = 0)
+
+particle_1 = sel1.get_selected_particles()
+sel2 = IMP.atom.Selection(root_hier, resolution=1, molecule=tuple_2[2],
+                          residue_index=tuple_2[0], copy_index = 0)
+particle_2 = sel2.get_selected_particles()
+model = root_hier.get_model()
+
+dr1 = IMP.core.DistanceRestraint(model, ts1, particle_1[0], particle_2[0])
+
+# shuffle configurations
+IMP.pmi.tools.shuffle_configuration(root_hier,
+                                    max_translation=500,
+                                    avoidcollision_rb=False,
+                                    bounding_box=((-400, -400, -400), (400, 400, 0)))
+
+sf_imp = IMP.core.RestraintsScoringFunction(dr1)
+score = sf_imp.evaluate(False)
+
+ji = dr1._get_jax()
+print(ji)
+jax_score_func = ji.score_func 
+jmodel = ji.get_jax_model()
+print("Initial JAX score:", jax_score_func(jmodel))
+print("Initial IMP score:", score)
+print("jax model:", jmodel)
+
+# Set up RMF output
+output = IMP.pmi.output.Output()
+output.init_rmf("shuffled_particles.rmf3", [root_hier])  # Initialize the RMF file
+output.write_rmf("shuffled_particles.rmf3")  # Write the RMF file
+output.close_rmf("shuffled_particles.rmf3")

@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import time
-from typing import Callable, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 
 def create_rmh_kernel(log_prob_fn: Callable, sigma: Union[float, jnp.ndarray] = 1.0):
@@ -56,6 +56,7 @@ def run_rmh_sampling(
     burnin: int = 0,
     thin: int = 1,
     save_interval: int = 1,
+    step_callback: Optional[Callable[[int, np.ndarray, float, bool], None]] = None,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """
@@ -72,6 +73,8 @@ def run_rmh_sampling(
         burnin: Number of initial steps to discard
         thin: Save every `thin` samples after burnin
         save_interval: How often to print progress (0 = no printing)
+        step_callback: Optional callback called after each step as
+            callback(step_index, position, log_prob, is_accepted)
         verbose: Whether to print progress
         
     Returns:
@@ -119,6 +122,14 @@ def run_rmh_sampling(
     for i in range(n_steps):
         curr_state, info = step_fn(keys[i], curr_state)
         accepts.append(float(info.is_accepted))
+
+        if step_callback is not None:
+            step_callback(
+                i,
+                np.array(curr_state.position),
+                float(curr_state.logdensity),
+                bool(info.is_accepted),
+            )
         
         # After burnin, save every `thin` steps
         if i >= burnin and (i - burnin) % thin == 0:

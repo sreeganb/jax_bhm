@@ -42,7 +42,10 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
+import tempfile
+import os
 
 import jax
 import jax.numpy as jnp
@@ -55,6 +58,9 @@ from .smc_base_sampler import (
     run_base_smc_hmc,
 )
 
+from .rmh import (
+    run_rmh_sampling
+)
 
 # =============================================================================
 # DOF space: flat-vector <-> structured IMP JAX model
@@ -280,7 +286,9 @@ class IMPDOFSpace:
             )
 
         # Patch xyz: rigid-body roots first, then flexible beads.
-        xyz = jm['xyz']
+        # Some IMP JAX model builders return NumPy arrays; convert once so
+        # `.at[...]` indexed updates are always available.
+        xyz = jnp.asarray(jm['xyz'])
         if self.n_rb > 0:
             xyz = xyz.at[jnp.asarray(self.rb_particle_indexes)].set(rb_t)
         if self.n_fb > 0:
@@ -597,3 +605,15 @@ def run_smc_on_imp_system(
         )
     else:
         raise ValueError(f"Unknown kernel '{kernel}'. Use 'rmh' or 'hmc'.")
+    
+def run_rmh_on_imp_system(adapter, sample_key, rmh_sigma, n_mcmc_steps, imp_model, save_rmf3_path=None, verbose=False):
+    """
+    1) Run the Random-walk Metropolis-Hastings (RMH) algorithm on an IMP system.
+    2) Return the final state, best positions, and best scores.
+    3) Optionally save the trajectory to an RMF3 file if a path is provided.
+    4) To save the RMF3 file, a helper function that just saves a h5py file which
+    can later be converted to an RMF3 file, the h5py file should store information
+    similar to what IMP does with its model hierarchy
+    """
+    
+    

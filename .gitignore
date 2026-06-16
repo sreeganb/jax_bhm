@@ -7,6 +7,9 @@ __pycache__/
 *.mrc
 *.db
 *.pdf
+*.aux
+*.toc
+*.out 
 
 # C extensions
 *.so

@@ -216,3 +216,293 @@ def inspect_hdf5(hdf5_file: str):
             for ptype in coords_grp.keys():
                 shape = coords_grp[ptype].shape
                 print(f"  {ptype}: {shape}")
+
+
+# =============================================================================
+# Sampler-agnostic trajectory writers
+# -----------------------------------------------------------------------------
+# Everything below works for the output of *any* BlackJAX sampler.  The only
+# contract is an ``xyz`` array of shape ``(n_frames, n_particles, 3)`` -- decode
+# your sampler's flat positions into that shape (e.g. with
+# ``sampling.wrapper_imp_blackjax.decode_positions_to_xyz``) and hand it over.
+# =============================================================================
+
+def _broadcast_radii(radii, n_particles: float, fallback: float = 1.0) -> np.ndarray:
+    """Return a ``(n_particles,)`` radius array from a scalar / array / None."""
+    if radii is None:
+        return np.full((n_particles,), float(fallback))
+    radii = np.asarray(radii, dtype=float).ravel()
+    if radii.size == 1:
+        return np.full((n_particles,), float(radii[0]))
+    if radii.size != n_particles:
+        raise ValueError(
+            f"radii has {radii.size} entries but there are {n_particles} particles"
+        )
+    return radii
+
+
+def save_xyz_h5(
+    h5_file: str,
+    xyz,
+    radii=None,
+    names=None,
+    log_probs=None,
+    verbose: bool = True,
+):
+    """Write an ``(n_frames, n_particles, 3)`` trajectory to a simple HDF5 file.
+
+    The layout is intentionally minimal and self-describing so it can be
+    re-loaded or converted to RMF3 later (see :func:`xyz_h5_to_rmf3`):
+
+      - ``coordinates``     : float64  ``(n_frames, n_particles, 3)``
+      - ``radii``           : float64  ``(n_particles,)``
+      - ``log_probabilities``: float64 ``(n_frames,)``   (optional)
+      - ``names``           : str       ``(n_particles,)`` (optional)
+
+    Works for *any* sampler -- it never imports IMP.
+    """
+    xyz = np.asarray(xyz, dtype=float)
+    if xyz.ndim != 3 or xyz.shape[-1] != 3:
+        raise ValueError(f"xyz must be (n_frames, n_particles, 3); got {xyz.shape}")
+    n_frames, n_particles, _ = xyz.shape
+
+    out = Path(h5_file)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(out, "w") as f:
+        f.attrs["n_frames"] = n_frames
+        f.attrs["n_particles"] = n_particles
+        f.create_dataset("coordinates", data=xyz, compression="gzip")
+        f.create_dataset("radii", data=_broadcast_radii(radii, n_particles))
+        if log_probs is not None:
+            f.create_dataset("log_probabilities",
+                             data=np.asarray(log_probs, dtype=float),
+                             compression="gzip")
+        if names is not None:
+            dt = h5py.string_dtype(encoding="utf-8")
+            f.create_dataset("names", data=np.asarray(names, dtype=object), dtype=dt)
+
+    if verbose:
+        print(f"Saved xyz trajectory ({n_frames} frames, {n_particles} particles) to {out}")
+
+
+def _build_particles(model, n_particles, radii, names):
+    """Create fresh XYZR particles under a root hierarchy (no source model)."""
+    root_p = IMP.Particle(model)
+    root_p.set_name("trajectory")
+    root_h = IMP.atom.Hierarchy.setup_particle(root_p)
+
+    radii = _broadcast_radii(radii, n_particles)
+    particles = []
+    for i in range(n_particles):
+        p = IMP.Particle(model)
+        p.set_name(names[i] if names is not None else f"bead_{i}")
+        IMP.core.XYZR.setup_particle(
+            p, IMP.algebra.Sphere3D(IMP.algebra.Vector3D(0.0, 0.0, 0.0), float(radii[i]))
+        )
+        IMP.atom.Mass.setup_particle(p, 1.0)
+        root_h.add_child(IMP.atom.Hierarchy.setup_particle(p))
+        particles.append(p)
+    return root_h, particles
+
+
+def _reuse_particles(model, particle_indexes, radii):
+    """Wrap existing IMP particles (by index) in a fresh root hierarchy.
+
+    This keeps each particle's real XYZR radius, so the RMF3 spheres match the
+    sizes you set up in your IMP model.
+    """
+    root_p = IMP.Particle(model)
+    root_p.set_name("trajectory")
+    root_h = IMP.atom.Hierarchy.setup_particle(root_p)
+
+    fallback = _broadcast_radii(radii, len(particle_indexes))
+    particles = []
+    for i, idx in enumerate(particle_indexes):
+        p = model.get_particle(IMP.ParticleIndex(int(idx)))
+        if not IMP.core.XYZR.get_is_setup(p):
+            IMP.core.XYZR.setup_particle(
+                p,
+                IMP.algebra.Sphere3D(IMP.algebra.Vector3D(0.0, 0.0, 0.0), float(fallback[i])),
+            )
+        # RMF requires every leaf to carry a Mass; add a nominal one if missing.
+        if not IMP.atom.Mass.get_is_setup(p):
+            IMP.atom.Mass.setup_particle(p, 1.0)
+        h = IMP.atom.Hierarchy(p) if IMP.atom.Hierarchy.get_is_setup(p) \
+            else IMP.atom.Hierarchy.setup_particle(p)
+        root_h.add_child(h)
+        particles.append(p)
+    return root_h, particles
+
+
+def write_xyz_trajectory_rmf3(
+    rmf3_file: str,
+    xyz,
+    imp_model=None,
+    particle_indexes=None,
+    radii=None,
+    names=None,
+    verbose: bool = True,
+):
+    """Write an ``(n_frames, n_particles, 3)`` trajectory straight to RMF3.
+
+    Two modes
+    ---------
+    * **Reuse IMP particles** (``imp_model`` + ``particle_indexes``):
+      the existing particles -- and therefore their true radii -- are written,
+      one frame per slice of ``xyz``.  Use this when you already built an IMP
+      model (it is the IMP-native path).
+    * **Fresh particles** (otherwise): a throwaway ``IMP.Model`` is created with
+      beads of the supplied ``radii``.  Use this when you only have coordinates.
+
+    Works for the output of any sampler; ``xyz`` is all it needs.
+    """
+    if not IMP_AVAILABLE:
+        raise ImportError(
+            "IMP is not installed. RMF3 writing requires IMP/RMF.\n"
+            "On Linux: conda install -c salilab imp"
+        )
+
+    xyz = np.asarray(xyz, dtype=float)
+    if xyz.ndim != 3 or xyz.shape[-1] != 3:
+        raise ValueError(f"xyz must be (n_frames, n_particles, 3); got {xyz.shape}")
+    n_frames, n_particles, _ = xyz.shape
+
+    out = Path(rmf3_file)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if imp_model is not None and particle_indexes is not None:
+        model = imp_model
+        root_h, particles = _reuse_particles(model, particle_indexes, radii)
+    else:
+        model = IMP.Model()
+        root_h, particles = _build_particles(model, n_particles, radii, names)
+
+    if len(particles) != n_particles:
+        raise ValueError(
+            f"{len(particles)} particles vs {n_particles} coordinate columns -- "
+            "particle_indexes must match the decoded xyz layout"
+        )
+
+    rmf = RMF.create_rmf_file(str(out))
+    rmf.set_description(f"Trajectory: {n_frames} frames, {n_particles} particles")
+    IMP.rmf.add_hierarchy(rmf, root_h)
+    IMP.rmf.add_restraints(rmf, [])
+
+    for frame_idx in range(n_frames):
+        frame = xyz[frame_idx]
+        for i, p in enumerate(particles):
+            IMP.core.XYZR(p).set_coordinates(
+                IMP.algebra.Vector3D(float(frame[i, 0]), float(frame[i, 1]), float(frame[i, 2]))
+            )
+        model.update()
+        IMP.rmf.save_frame(rmf, f"frame_{frame_idx}")
+        if verbose and (frame_idx % 100 == 0 or frame_idx == n_frames - 1):
+            print(f"  RMF3 frame {frame_idx + 1}/{n_frames}")
+
+    rmf.close()
+    del rmf
+    if verbose:
+        print(f"Saved RMF3 trajectory to {out}")
+
+
+class RMF3TrajectoryWriter:
+    """Stream frames to an RMF3 file *during* sampling.
+
+    The instance is callable with the signature BlackJAX-style step callbacks
+    use -- ``writer(step, position, log_prob, accepted)`` -- so it can be passed
+    straight to :func:`sampling.rmh.run_rmh_sampling` (or any custom loop) to
+    append one frame every ``stride`` steps without buffering the whole chain.
+
+    Parameters
+    ----------
+    rmf3_file
+        Output path.
+    decode_xyz
+        Callable ``flat_position -> (n_particles, 3)`` (e.g.
+        ``adapter.decode_xyz``).
+    imp_model, particle_indexes
+        If both given, reuse those IMP particles (true radii).
+    radii, names
+        Used when building fresh particles.
+    stride
+        Append a frame every ``stride`` steps (default 1 = every step).
+
+    Use as a context manager so the file is always closed::
+
+        with RMF3TrajectoryWriter("traj.rmf3", adapter.decode_xyz,
+                                  imp_model=m, particle_indexes=[i0, i1]) as w:
+            run_rmh_sampling(..., step_callback=w)
+    """
+
+    def __init__(self, rmf3_file, decode_xyz, imp_model=None,
+                 particle_indexes=None, radii=None, names=None, stride=1):
+        if not IMP_AVAILABLE:
+            raise ImportError("IMP is not installed; cannot stream RMF3 frames.")
+        self.decode_xyz = decode_xyz
+        self.stride = max(1, int(stride))
+        self._frame = 0
+        self._initialised = False
+
+        self._rmf3_file = str(rmf3_file)
+        Path(self._rmf3_file).parent.mkdir(parents=True, exist_ok=True)
+
+        self._imp_model = imp_model
+        self._particle_indexes = particle_indexes
+        self._radii = radii
+        self._names = names
+        self._rmf = None
+        self._particles = None
+
+    def _lazy_init(self, n_particles):
+        if self._imp_model is not None and self._particle_indexes is not None:
+            self._model = self._imp_model
+            root_h, self._particles = _reuse_particles(
+                self._model, self._particle_indexes, self._radii)
+        else:
+            self._model = IMP.Model()
+            root_h, self._particles = _build_particles(
+                self._model, n_particles, self._radii, self._names)
+        self._rmf = RMF.create_rmf_file(self._rmf3_file)
+        IMP.rmf.add_hierarchy(self._rmf, root_h)
+        IMP.rmf.add_restraints(self._rmf, [])
+        self._initialised = True
+
+    def __call__(self, step, position, log_prob=None, accepted=None):
+        if step % self.stride != 0:
+            return
+        frame = np.asarray(self.decode_xyz(position), dtype=float)
+        if not self._initialised:
+            self._lazy_init(frame.shape[0])
+        for i, p in enumerate(self._particles):
+            IMP.core.XYZR(p).set_coordinates(
+                IMP.algebra.Vector3D(float(frame[i, 0]), float(frame[i, 1]), float(frame[i, 2]))
+            )
+        self._model.update()
+        IMP.rmf.save_frame(self._rmf, f"frame_{self._frame}")
+        self._frame += 1
+
+    def close(self):
+        if self._rmf is not None:
+            self._rmf.close()
+            del self._rmf
+            self._rmf = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
+def xyz_h5_to_rmf3(h5_file: str, rmf3_file: str, imp_model=None,
+                   particle_indexes=None, verbose: bool = True):
+    """Convert a file written by :func:`save_xyz_h5` into RMF3."""
+    with h5py.File(h5_file, "r") as f:
+        xyz = f["coordinates"][:]
+        radii = f["radii"][:] if "radii" in f else None
+        names = [n.decode() if isinstance(n, bytes) else n
+                 for n in f["names"][:]] if "names" in f else None
+    write_xyz_trajectory_rmf3(rmf3_file, xyz, imp_model=imp_model,
+                              particle_indexes=particle_indexes,
+                              radii=radii, names=names, verbose=verbose)

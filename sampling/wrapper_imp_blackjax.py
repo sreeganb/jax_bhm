@@ -47,9 +47,19 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import tempfile
 import os
 
+# ---------------------------------------------------------------------------
+# SciPy's array-API backend lets ``scipy.spatial.transform.Rotation`` operate
+# directly on JAX arrays, so we can build rotation proposals that are
+# jit-/scan-able *and* never have to touch raw quaternion algebra by hand.
+# The flag MUST be set before SciPy is imported, hence it lives up here.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("SCIPY_ARRAY_API", "1")
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import blackjax
+from scipy.spatial.transform import Rotation as _Rotation
 
 # Reuse the BlackJAX runners that already live in this package.
 # (Relative import so the adapter can be installed as part of jax_bhm.)
@@ -308,6 +318,86 @@ class IMPDOFSpace:
         """Return the ``(n_total_xyz, 3)`` global xyz array for ``flat``."""
         return self.decode(flat)['xyz']
 
+    # ------------------------------------------------------------------
+    # Static metadata used by trajectory writers
+    # ------------------------------------------------------------------
+    def radii(self) -> Optional[np.ndarray]:
+        """Per-particle radii ``(n_total_xyz,)`` from the template, or ``None``.
+
+        IMP's JAX model stores sphere radii under the ``'r'`` key.  Trajectory
+        writers use these so the RMF3 spheres match the real IMP particle
+        sizes (e.g. your two beads of radius 12 and 6).
+        """
+        r = self.template_jm.get('r', None)
+        return None if r is None else np.asarray(r)
+
+    # ------------------------------------------------------------------
+    # Structured RMH proposal  (the SciPy SO(3) trick)
+    # ------------------------------------------------------------------
+    def so3_proposal(
+        self,
+        trans_sigma: float = 3.0,
+        rot_sigma: float = 0.1,
+        flex_sigma: float = 3.0,
+    ) -> Callable[[jax.Array, jnp.ndarray], jnp.ndarray]:
+        """Build a *structured* RMH proposal ``q' = f(key, q)``.
+
+        Why not just a plain Gaussian on the flat vector?
+        -------------------------------------------------
+        Each rigid body's orientation is stored as a 4-component quaternion.
+        A naive Gaussian random walk on those four numbers also perturbs the
+        physically meaningless *radial* direction of the quaternion, so
+        ``||q||`` slowly drifts away from 1.  As ``||q||`` grows a fixed step
+        maps to an ever-smaller rotation: acceptance creeps to 1 and the chain
+        effectively freezes (demonstrated in
+        ``imp_testing/rigid_body_rotations/docking_so3_scipy.ipynb``).
+
+        The fix is to take the step on the rotation group itself, exactly as in
+        that notebook::
+
+            q' = ( R.from_quat(q) ∘ R.from_rotvec(rot_sigma · ξ) ).as_quat(),
+                 ξ ~ N(0, I₃)
+
+        This never leaves S³, needs no renormalisation, and is symmetric, so a
+        plain Metropolis acceptance applies.  Translations and flexible beads
+        keep ordinary isotropic Gaussian steps.
+
+        Parameters
+        ----------
+        trans_sigma
+            Std-dev (Å) of the Gaussian step on rigid-body translations.
+        rot_sigma
+            Std-dev (radians) of the rotation-vector step; ~0.1 ≈ 6°.
+        flex_sigma
+            Std-dev (Å) of the Gaussian step on flexible beads.
+        """
+        n_rb, n_fb = self.n_rb, self.n_fb
+
+        def proposal(key: jax.Array, flat: jnp.ndarray) -> jnp.ndarray:
+            k_t, k_r, k_f = jax.random.split(key, 3)
+            rb_t, rb_q, flex = self._slice(flat)
+
+            # --- translations: isotropic Gaussian -------------------------
+            rb_t = rb_t + jax.random.normal(k_t, rb_t.shape) * trans_sigma
+
+            # --- rotations: group-exponential step, stays on S³ -----------
+            if n_rb > 0:
+                xi = jax.random.normal(k_r, (n_rb, 3)) * rot_sigma
+                rb_q = (_Rotation.from_quat(rb_q)
+                        * _Rotation.from_rotvec(xi)).as_quat()
+
+            # --- flexible beads: isotropic Gaussian -----------------------
+            if n_fb > 0:
+                flex = flex + jax.random.normal(k_f, flex.shape) * flex_sigma
+
+            return jnp.concatenate([
+                rb_t.reshape(-1),
+                rb_q.reshape(-1),
+                flex.reshape(-1),
+            ])
+
+        return proposal
+
 
 # =============================================================================
 # Adapter: provides log_prior, log_likelihood, log_prob over flat vectors
@@ -388,6 +478,13 @@ class IMPSMCAdapter:
 
     def decode_xyz(self, flat: jnp.ndarray) -> jnp.ndarray:
         return self.dof_space.decode_xyz(flat)
+
+    def radii(self) -> Optional[np.ndarray]:
+        return self.dof_space.radii()
+
+    def so3_proposal(self, **kwargs) -> Callable[[jax.Array, jnp.ndarray], jnp.ndarray]:
+        """Structured SO(3) RMH proposal (see :meth:`IMPDOFSpace.so3_proposal`)."""
+        return self.dof_space.so3_proposal(**kwargs)
 
     # ------------------------------------------------------------------
     # Scores
@@ -519,6 +616,12 @@ def run_smc_on_imp_system(
     init_trans_jitter: float = 5.0,
     init_quat_jitter: float = 0.1,
     init_flex_jitter: float = 2.0,
+    # ---- Trajectory output (optional; same writers as the RMH runner)
+    imp_model: Optional[Any] = None,
+    particle_indexes: Optional[Sequence[int]] = None,
+    save_rmf3_path: Optional[str] = None,
+    save_h5_path: Optional[str] = None,
+    save_stride: int = 1,
     # ---- Misc
     verbose: bool = True,
 ) -> Tuple[Any, List[Any], np.ndarray, np.ndarray, np.ndarray]:
@@ -574,7 +677,7 @@ def run_smc_on_imp_system(
 
     # ---- dispatch to the BlackJAX-base-SMC runner --------------------------
     if kernel == "rmh":
-        return run_base_smc_rmh(
+        result = run_base_smc_rmh(
             log_prior_fn=log_prior_fn,
             log_likelihood_fn=log_likelihood_fn,
             log_prob_fn=log_prob_fn,
@@ -588,7 +691,7 @@ def run_smc_on_imp_system(
             verbose=verbose,
         )
     elif kernel == "hmc":
-        return run_base_smc_hmc(
+        result = run_base_smc_hmc(
             log_prior_fn=log_prior_fn,
             log_likelihood_fn=log_likelihood_fn,
             log_prob_fn=log_prob_fn,
@@ -605,15 +708,208 @@ def run_smc_on_imp_system(
         )
     else:
         raise ValueError(f"Unknown kernel '{kernel}'. Use 'rmh' or 'hmc'.")
-    
-def run_rmh_on_imp_system(adapter, sample_key, rmh_sigma, n_mcmc_steps, imp_model, save_rmf3_path=None, verbose=False):
+
+    # ---- optional trajectory output (best particle per temperature step) ---
+    # ``best_positions`` is element [2] of the runner's return tuple.
+    if (save_rmf3_path is not None) or (save_h5_path is not None):
+        best_positions = result[2]
+        best_scores = result[3]
+        save_sampler_trajectory(
+            adapter, best_positions,
+            save_rmf3_path=save_rmf3_path,
+            save_h5_path=save_h5_path,
+            imp_model=imp_model,
+            particle_indexes=particle_indexes,
+            log_probs=best_scores,
+            stride=save_stride,
+            verbose=verbose,
+        )
+
+    return result
+
+
+# =============================================================================
+# Sampler-agnostic helpers
+# =============================================================================
+
+def decode_positions_to_xyz(adapter: IMPSMCAdapter, positions) -> np.ndarray:
+    """Decode flat samples into a Cartesian trajectory.
+
+    ``positions`` is ``(n_frames, n_dims)`` (the chain produced by *any*
+    BlackJAX sampler).  Returns ``(n_frames, n_particles, 3)``, ready to hand
+    to :func:`io_utils.rmf3_converter.write_xyz_trajectory_rmf3` or
+    :func:`io_utils.rmf3_converter.save_xyz_h5`.
     """
-    1) Run the Random-walk Metropolis-Hastings (RMH) algorithm on an IMP system.
-    2) Return the final state, best positions, and best scores.
-    3) Optionally save the trajectory to an RMF3 file if a path is provided.
-    4) To save the RMF3 file, a helper function that just saves a h5py file which
-    can later be converted to an RMF3 file, the h5py file should store information
-    similar to what IMP does with its model hierarchy
+    positions = np.asarray(positions)
+    return np.stack(
+        [np.asarray(adapter.decode_xyz(jnp.asarray(p))) for p in positions],
+        axis=0,
+    )
+
+
+def save_sampler_trajectory(
+    adapter: IMPSMCAdapter,
+    positions,
+    save_rmf3_path: Optional[str] = None,
+    save_h5_path: Optional[str] = None,
+    imp_model: Optional[Any] = None,
+    particle_indexes: Optional[Sequence[int]] = None,
+    log_probs=None,
+    stride: int = 1,
+    verbose: bool = False,
+) -> Optional[np.ndarray]:
+    """Decode + save a trajectory from *any* BlackJAX sampler.
+
+    This is the single entry point the wrappers below use, and the one to call
+    yourself for HMC/NUTS/SMC chains: give it the adapter and a stack of flat
+    positions and it will
+
+    1. decode them to ``(n_frames, n_particles, 3)`` xyz,
+    2. optionally write an ``.npz``-free HDF5 trajectory (``save_h5_path``),
+    3. optionally write an RMF3 trajectory (``save_rmf3_path``), reusing the
+       real IMP particles (true radii) when ``imp_model`` is supplied.
+
+    Returns the decoded xyz array (or ``None`` if nothing was requested).
     """
-    
-    
+    if save_rmf3_path is None and save_h5_path is None:
+        return None
+
+    positions = np.asarray(positions)[::stride]
+    if log_probs is not None:
+        log_probs = np.asarray(log_probs)[::stride]
+
+    xyz = decode_positions_to_xyz(adapter, positions)
+    radii = adapter.radii()
+
+    # When the caller hands us the IMP model but no explicit index list, use the
+    # natural particle order: row ``i`` of the decoded xyz is IMP particle ``i``.
+    # This lets the RMF3 writer reuse the real IMP particles (true radii).
+    if imp_model is not None and particle_indexes is None:
+        particle_indexes = list(range(xyz.shape[1]))
+
+    if save_h5_path is not None:
+        from io_utils.rmf3_converter import save_xyz_h5
+        save_xyz_h5(save_h5_path, xyz, radii=radii, log_probs=log_probs, verbose=verbose)
+
+    if save_rmf3_path is not None:
+        from io_utils.rmf3_converter import write_xyz_trajectory_rmf3
+        write_xyz_trajectory_rmf3(
+            save_rmf3_path, xyz,
+            imp_model=imp_model,
+            particle_indexes=particle_indexes,
+            radii=radii,
+            verbose=verbose,
+        )
+
+    return xyz
+
+
+# =============================================================================
+# RMH runner  (uses the SciPy SO(3) proposal -- no manual quaternion algebra)
+# =============================================================================
+
+def run_rmh_on_imp_system(
+    adapter: IMPSMCAdapter,
+    sample_key: jax.Array,
+    rmh_sigma: float = 3.0,
+    n_mcmc_steps: int = 1000,
+    imp_model: Optional[Any] = None,
+    *,
+    rot_sigma: float = 0.1,
+    trans_sigma: Optional[float] = None,
+    flex_sigma: Optional[float] = None,
+    initial_position: Optional[jax.Array] = None,
+    particle_indexes: Optional[Sequence[int]] = None,
+    save_rmf3_path: Optional[str] = None,
+    save_h5_path: Optional[str] = None,
+    stride: int = 1,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, Optional[List[Any]], np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Random-walk Metropolis on an IMP system, the simple way.
+
+    The proposal is the structured SciPy SO(3) move from
+    :meth:`IMPDOFSpace.so3_proposal`: translations and flexible beads get plain
+    Gaussian steps, while each rigid-body orientation is rotated on the group
+    itself.  That removes every bit of manual quaternion bookkeeping -- no
+    renormalisation, no norm prior, no Jacobian fudge -- and keeps mixing
+    healthy (cf. ``imp_testing/rigid_body_rotations/docking_so3_scipy.ipynb``).
+
+    Sampling is a single ``jax.lax.scan`` over ``blackjax.rmh`` (fast, fully
+    jitted).  Afterwards the chain is decoded and, if requested, written to
+    RMF3 / HDF5 via :func:`save_sampler_trajectory`.
+
+    Parameters
+    ----------
+    adapter
+        :class:`IMPSMCAdapter`.
+    sample_key
+        JAX PRNGKey.
+    rmh_sigma
+        Default Gaussian std-dev (Å) for both translations and flexible beads.
+        Override either independently with ``trans_sigma`` / ``flex_sigma``.
+    n_mcmc_steps
+        Number of RMH steps.
+    imp_model
+        The IMP ``Model``.  When given (with ``particle_indexes`` or the
+        natural ``0..n-1`` order) the RMF3 trajectory reuses the real particles
+        so sphere radii match your IMP setup.
+    rot_sigma
+        Rotation-vector step std-dev in radians (~0.1 ≈ 6°).
+    initial_position
+        Starting flat vector; defaults to ``adapter.encode()``.
+    save_rmf3_path / save_h5_path
+        Optional trajectory outputs (one frame per saved sample).
+    stride
+        Save every ``stride``-th frame.
+    verbose
+        Print a short summary.
+
+    Returns
+    -------
+    ``(positions, None, best_positions, best_scores, xyz_trajectory)``
+        Kept as a 5-tuple for symmetry with :func:`run_smc_on_imp_system`.
+        For RMH ``best_positions`` is just the chain and ``best_scores`` the
+        per-sample log-probabilities.
+    """
+    trans_sigma = rmh_sigma if trans_sigma is None else trans_sigma
+    flex_sigma = rmh_sigma if flex_sigma is None else flex_sigma
+
+    logdensity = jax.jit(adapter.log_prob)
+    proposal = adapter.so3_proposal(
+        trans_sigma=trans_sigma, rot_sigma=rot_sigma, flex_sigma=flex_sigma
+    )
+    kernel = blackjax.rmh(logdensity, proposal)
+
+    x0 = adapter.encode() if initial_position is None else jnp.asarray(initial_position)
+    state0 = kernel.init(x0)
+
+    @jax.jit
+    def _one(state, key):
+        state, info = kernel.step(key, state)
+        return state, (state.position, state.logdensity, info.is_accepted)
+
+    keys = jax.random.split(sample_key, n_mcmc_steps)
+    _, (chain, logp, acc) = jax.lax.scan(_one, state0, keys)
+
+    positions = np.asarray(chain)          # (n_steps, n_dims)
+    log_probs = np.asarray(logp)           # (n_steps,)
+    acceptance = float(np.mean(np.asarray(acc)))
+
+    if verbose:
+        print(adapter.dof_summary())
+        print(f"  RMH steps          : {n_mcmc_steps}")
+        print(f"  sigma (trans/rot/flex): {trans_sigma} / {rot_sigma} / {flex_sigma}")
+        print(f"  Acceptance rate    : {acceptance:.1%}")
+
+    xyz_trajectory = save_sampler_trajectory(
+        adapter, positions,
+        save_rmf3_path=save_rmf3_path,
+        save_h5_path=save_h5_path,
+        imp_model=imp_model,
+        particle_indexes=particle_indexes,
+        log_probs=log_probs,
+        stride=stride,
+        verbose=verbose,
+    )
+
+    return positions, None, positions, log_probs, xyz_trajectory

@@ -15,6 +15,7 @@ import IMP.pmi.output
 import IMP.pmi.macros
 import IMP.pmi.topology
 import ihm.cross_linkers
+import jax.numpy as jnp
 
 import sys
 import os
@@ -129,6 +130,20 @@ rb_jax_indices = []
 # jmrigid is your _get_rigid_bodies(m) output
 rb_map = jmrigid.rb_index_from_particle
 print("rigid body map : ", rb_map)
+for mover in movers:
+    p_idx = get_mover_particle_index(mover) # this needs to be figured out 
+    name = mover.get_name()
+    
+    if "RigidBody" in name:
+        # Map the IMP particle index to the JAX rigid body index
+        # e.g., Particle 1900 -> JAX RB Index 0
+        jax_rb_idx = rb_map[int(p_idx)]
+        rb_jax_indices.append(jax_rb_idx)
+    elif "BallMover" in name or "MonteCarlo" in name: # flexible beads
+        flex_p_indices.append(int(p_idx))
+
+flex_p_indices = jnp.array(flex_p_indices)
+rb_jax_indices = jnp.array(rb_jax_indices)
 #----------------------------------------------------------------------------
 """
 Some outputs from native IMP, before converting to JAX.

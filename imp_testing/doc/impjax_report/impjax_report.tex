@@ -1,0 +1,24 @@
+\documentclass[]{article}
+
+\title{JAXifying IMP modeling pipeline}
+\author{Sree Ganesh Balasubramani}
+\begin{document}
+
+\maketitle
+\section{IMP}
+In IMP, a ``particle'' is the universal base unit, but it does not necessarily
+correspond to a physical atom or a fragment of a molecule. A ``particle'' can be 
+\begin{itemize}
+    \item A physical residue
+    \item A structural container (a chain, a molecule, a state)
+    \item A restraint or a bond
+    \item A rigid body reference frame
+\end{itemize}
+IMP allocates a large, flat, internal table to store properties. Because a model has 
+hierarchies, stereochemistry restraints, and system structures, IMP allocates a lot of 
+particles indices corresponding to these.  
+To obtain particles that IMP creates in a model 
+\begin{verbatim}
+    IMP.get_particles(model, model.get_particle_indexes())
+\end{verbatim}
+\end{document}

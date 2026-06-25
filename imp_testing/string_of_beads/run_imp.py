@@ -52,7 +52,6 @@ output_objects = [] # keep a list of functions that need to be reported
 rmf_restraints = []
 
 print("\nBuild complete.")
-print("Movers:", dof.get_movers())
 
 # Print molecule/bead counts per type
 for state in IMP.atom.get_by_type(root_hier, IMP.atom.STATE_TYPE):
@@ -104,8 +103,49 @@ output = IMP.pmi.output.Output()
 output.init_rmf("shuffled_particles.rmf3", [root_hier])  # Initialize the RMF file
 output.write_rmf("shuffled_particles.rmf3")  # Write the RMF file
 
+# Extract the flexible beads from your PMI hierarchy
+movers = dof.get_movers()
+print("movers: ", movers, "number of movers: ", len(movers))
+
 sf_imp = IMP.core.RestraintsScoringFunction(dr1)
 score = sf_imp.evaluate(False)
+
+#--------------------------------------------------------------------------------------------
+"""
+Find out all the fun IMP commands that give us the indices of sampled particles
+including rigid bodies, basically all the information we require
+"""
+
+print("particles from model: ", IMP.get_particles(m, m.get_particle_indexes()))
+print("number of particles from model:", len(IMP.get_particles(m, m.get_particle_indexes())))
+print("indices of particles: ", m.get_particle_indexes())
+
+from IMP.core._jax_rigid import _get_rigid_bodies
+jmrigid = _get_rigid_bodies(m)
+print("JAX rigid bodies: ", jmrigid)
+flex_p_indices = []
+rb_jax_indices = []
+
+# jmrigid is your _get_rigid_bodies(m) output
+rb_map = jmrigid.rb_index_from_particle
+print("rigid body map : ", rb_map)
+#----------------------------------------------------------------------------
+"""
+Some outputs from native IMP, before converting to JAX.
+Such as the hierarchy and where the coordinates are stored and how they are
+stored and so on.
+"""
+print("root hierarchy:", root_hier)
+print("root hierarchy children:", root_hier.get_children())
+print(root_hier.get_child(0))
+print("length of state: ", len(root_hier.get_child(0).get_child(0).get_child(0).get_child(0).get_children()))
+print("state: ", root_hier.get_child(0).get_child(0).get_children())
+print(root_hier.get_child(0).get_child(0).get_child(0).get_child(0).get_child(0))
+
+
+imp_dict = root_hier.get_child(0).get_child(0).get_child(0).get_child(0).get_children()
+# pick out the coordinates from each entry in this dictionary
+#-----------------------------------------------------------------------------
 
 ji = dr1._get_jax()
 print(ji)
@@ -162,6 +202,7 @@ def particle_flags(model, particle_index):
         if decorator_is_setup(decorator, model, particle_index, particle)
     ]
 
+print("the complete jax model: ", jmodel)
 
 def print_jax_model_diagnostics(model, root_hier, jmodel):
     jm_xyz = np.asarray(jmodel["xyz"])

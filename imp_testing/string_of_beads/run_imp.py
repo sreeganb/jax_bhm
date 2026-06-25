@@ -124,26 +124,24 @@ print("indices of particles: ", m.get_particle_indexes())
 from IMP.core._jax_rigid import _get_rigid_bodies
 jmrigid = _get_rigid_bodies(m)
 print("JAX rigid bodies: ", jmrigid)
-flex_p_indices = []
-rb_jax_indices = []
 
 # jmrigid is your _get_rigid_bodies(m) output
 rb_map = jmrigid.rb_index_from_particle
 print("rigid body map : ", rb_map)
-for mover in movers:
-    p_idx = get_mover_particle_index(mover) # this needs to be figured out 
-    name = mover.get_name()
-    
-    if "RigidBody" in name:
-        # Map the IMP particle index to the JAX rigid body index
-        # e.g., Particle 1900 -> JAX RB Index 0
-        jax_rb_idx = rb_map[int(p_idx)]
-        rb_jax_indices.append(jax_rb_idx)
-    elif "BallMover" in name or "MonteCarlo" in name: # flexible beads
-        flex_p_indices.append(int(p_idx))
 
-flex_p_indices = jnp.array(flex_p_indices)
-rb_jax_indices = jnp.array(rb_jax_indices)
+from IMP.pmi.tools import get_rbs_and_beads
+
+rbs, beads =get_rbs_and_beads(root_hier)
+
+print("rigid bodies: ", rbs)
+print("beads: ", beads)
+"""
+A function to get the rigid body and flexible bead original indices
+required for bookkeeping while using IMP JAX
+Select molecules, and then get particles for these selections
+"""
+get_particles_at_resolution_one from pmi1 function to get these particles
+
 #----------------------------------------------------------------------------
 """
 Some outputs from native IMP, before converting to JAX.

@@ -17,6 +17,8 @@ import IMP.pmi.topology
 import ihm.cross_linkers
 import jax.numpy as jnp
 
+import IMP.pmi1.analysis
+
 import sys
 import os
 
@@ -117,7 +119,7 @@ Find out all the fun IMP commands that give us the indices of sampled particles
 including rigid bodies, basically all the information we require
 """
 
-print("particles from model: ", IMP.get_particles(m, m.get_particle_indexes()))
+print("\nparticles from model: ", IMP.get_particles(m, m.get_particle_indexes()), "\n\n")
 print("number of particles from model:", len(IMP.get_particles(m, m.get_particle_indexes())))
 print("indices of particles: ", m.get_particle_indexes())
 
@@ -140,7 +142,6 @@ A function to get the rigid body and flexible bead original indices
 required for bookkeeping while using IMP JAX
 Select molecules, and then get particles for these selections
 """
-get_particles_at_resolution_one from pmi1 function to get these particles
 
 #----------------------------------------------------------------------------
 """

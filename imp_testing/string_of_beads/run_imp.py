@@ -17,8 +17,6 @@ import IMP.pmi.topology
 import ihm.cross_linkers
 import jax.numpy as jnp
 
-import IMP.pmi1.analysis
-
 import sys
 import os
 
@@ -142,6 +140,52 @@ A function to get the rigid body and flexible bead original indices
 required for bookkeeping while using IMP JAX
 Select molecules, and then get particles for these selections
 """
+# Do a selection of the molecule first and then get the particle indices
+# select KCOIL 
+import itertools
+
+def get_all_leaves(list_of_hs):
+    """ Just get the leaves from a list of hierarchies """
+    lvs = list(itertools.chain.from_iterable(
+        IMP.atom.get_leaves(item) for item in list_of_hs))
+    return lvs
+
+def get_rbs_and_beads(hiers):
+    """Returns unique objects in original order"""
+    rbs = set()
+    beads = []
+    rbs_ordered = []
+    if not hasattr(hiers, '__iter__'):
+        hiers = [hiers]
+    for p in get_all_leaves(hiers):
+        if IMP.core.RigidMember.get_is_setup(p):
+            rb = IMP.core.RigidMember(p).get_rigid_body()
+            if rb not in rbs:
+                rbs.add(rb)
+                rbs_ordered.append(rb)
+        elif IMP.core.NonRigidMember.get_is_setup(p):
+            rb = IMP.core.NonRigidMember(p).get_rigid_body()
+            if rb not in rbs:
+                rbs.add(rb)
+                rbs_ordered.append(rb)
+            beads.append(p)
+        else:
+            beads.append(p)
+    return rbs_ordered, beads
+print("\n\n\nall the leaves in the hierarchy: ", IMP.atom.get_leaves(root_hier), "\n\n\n")
+print("\n particle index : ", [p.get_particle_index() for p in IMP.atom.get_leaves(root_hier)], "\n\n\n")
+rbs, beads = get_rbs_and_beads(root_hier)
+print("from PMI tools, the rbs and beads: ", rbs, beads)
+
+# Following along the code used inside of the _jax_rigid function inside of 
+# IMP/core
+_FB_LIST_KEY = IMP.ModelKey("flexible bead list")
+def get_flexible_bead_indices(model):
+    assert model.get_has_data(_FB_LIST_KEY), "Model does not have flexible bead list"
+    fbl = model.get_data(_FB_LIST_KEY)
+    fbl = IMP.SingletonContainer(fbl)
+    return fbl.get_contents()
+get_flexible_bead_indices(m)
 
 #----------------------------------------------------------------------------
 """
@@ -152,10 +196,10 @@ stored and so on.
 print("root hierarchy:", root_hier)
 print("root hierarchy children:", root_hier.get_children())
 print(root_hier.get_child(0))
+print("child: ", root_hier.get_child(0).get_children())
 print("length of state: ", len(root_hier.get_child(0).get_child(0).get_child(0).get_child(0).get_children()))
 print("state: ", root_hier.get_child(0).get_child(0).get_children())
 print(root_hier.get_child(0).get_child(0).get_child(0).get_child(0).get_child(0))
-
 
 imp_dict = root_hier.get_child(0).get_child(0).get_child(0).get_child(0).get_children()
 # pick out the coordinates from each entry in this dictionary
@@ -171,7 +215,6 @@ print("jax model:", jmodel)
 
 # write JAX model to file for inspection as a JAX numpy array as a csv file
 import numpy as np
-
 
 def decorator_is_setup(decorator, model, particle_index, particle):
     for args in ((model, particle_index), (particle,), (particle_index,)):

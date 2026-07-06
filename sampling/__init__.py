@@ -30,8 +30,15 @@ Public API
 """
 
 from .wrapper_imp_blackjax import (
+    FlexibleBeadBlock,
     IMPDOFSpace,
+    IMPLogPosterior,
     IMPSMCAdapter,
+    IMPParameterSpace,
+    RMHResult,
+    build_flexible_bead_rmh_wrapper,
+    make_imp_score_function,
+    run_rmh_on_imp_system,
     run_smc_on_imp_system,
 )
 
@@ -51,8 +58,15 @@ __all__ = [
     'run_tempered_smc',
     'get_smc_samples',
     'get_best_sample',
+    'FlexibleBeadBlock',
     "IMPDOFSpace",
+    "IMPParameterSpace",
+    "IMPLogPosterior",
     "IMPSMCAdapter",
+    "RMHResult",
+    "make_imp_score_function",
+    "build_flexible_bead_rmh_wrapper",
+    "run_rmh_on_imp_system",
     "run_smc_on_imp_system",
     "run_base_smc_rmh",
     "run_base_smc_hmc",

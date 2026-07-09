@@ -102,6 +102,8 @@ def build_imp_system():
     distance_max = 10.0
     kappa = 40.0
     n_extra_restraints = 10
+    # adding distance restraints only between flexible beads and not the 
+    # rigid bodies
     n_pairs = 1 + n_extra_restraints
     distance_restraints = []
 
@@ -131,6 +133,7 @@ def build_imp_system():
             )
 
         dr = IMP.core.DistanceRestraint(m, ts, particle_1[0], particle_2[0])
+        print(f"Added distance restraint for residue pair {residue_index}-{residue_index}.")
         distance_restraints.append(dr)
 
     print(f"Added {len(distance_restraints)} matched distance restraints (1-1 to {n_pairs}-{n_pairs}).")

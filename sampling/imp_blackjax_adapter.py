@@ -97,6 +97,34 @@ def _normalise_quat(q: jnp.ndarray) -> jnp.ndarray:
     return q / (jnp.linalg.norm(q) + 1e-12)
 
 
+def _quat_multiply(q1: jnp.ndarray, q2: jnp.ndarray) -> jnp.ndarray:
+    """Hamilton product for quaternions stored as [w, x, y, z]."""
+    w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
+    w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
+    return jnp.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
+
+
+def _rotvec_to_quat(rotvec: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+    """Exponential-map conversion from rotation vector to quaternion [w, x, y, z]."""
+    theta = jnp.linalg.norm(rotvec)
+    half = 0.5 * theta
+    # Stable sin(half)/theta near theta=0 via first-order limit.
+    scale = jnp.where(theta > eps, jnp.sin(half) / theta, 0.5)
+    xyz = scale * rotvec
+    quat = jnp.array([jnp.cos(half), xyz[0], xyz[1], xyz[2]])
+    return _normalise_quat(quat)
+
+
+def _canonicalize_quat(q: jnp.ndarray) -> jnp.ndarray:
+    """Fix quaternion sign ambiguity by keeping non-negative scalar part."""
+    return jnp.where(q[0] < 0.0, -q, q)
+
+
 def _get_rb_from_mover(mover) -> IMP.core.RigidBody:
     """Return an IMP.core.RigidBody from old/new RigidBodyMover APIs."""
     get_rb = getattr(mover, "get_rigid_body", None)
@@ -693,20 +721,92 @@ class IMPSMCAdapter:
         base = self.dof_space.encode()  # (n_dof,)
         n_dof = self.dof_space.n_dof
 
-        key, subkey = jax.random.split(rng_key)
-        noise = jax.random.normal(subkey, shape=(n_particles, n_dof)) * translation_sigma
-
         # Start from the encoded initial configuration, broadcast to particles.
-        positions = jnp.broadcast_to(jnp.asarray(base), (n_particles, n_dof)) + noise
+        positions = jnp.broadcast_to(jnp.asarray(base), (n_particles, n_dof))
 
-        # Re-normalise the quaternion slice for each rigid body.
+        # Flexible + translation perturbations in Euclidean space.
+        key_trans, key_fb, key_rot = jax.random.split(rng_key, 3)
+
+        if self._fb_indices.shape[0] > 0:
+            n_fb = int(self._fb_indices.shape[0])
+            fb_noise = jax.random.normal(key_fb, shape=(n_particles, 3 * n_fb)) * translation_sigma
+            positions = positions.at[:, self._fb_dof_offset : self._fb_dof_offset + 3 * n_fb].add(fb_noise)
+
+        # Rigid-body initialization: translation Gaussian + SO(3) rotvec jitter.
+        trans_noise_all = jax.random.normal(key_trans, shape=(n_particles, 3 * len(self.dof_space.rb_descriptors)))
+        rotvec_noise_all = jax.random.normal(key_rot, shape=(n_particles, 3 * len(self.dof_space.rb_descriptors)))
+
         for rb in self.dof_space.rb_descriptors:
             o = rb["dof_offset"]
-            q_slice = positions[:, o + 3 : o + 7]
-            norms = jnp.linalg.norm(q_slice, axis=-1, keepdims=True) + 1e-12
-            positions = positions.at[:, o + 3 : o + 7].set(q_slice / norms)
+            rb_idx = o // 7
+            t_noise = trans_noise_all[:, 3 * rb_idx : 3 * (rb_idx + 1)] * translation_sigma
+            positions = positions.at[:, o : o + 3].add(t_noise)
+
+            q_old = positions[:, o + 3 : o + 7]
+            delta_rotvec = rotvec_noise_all[:, 3 * rb_idx : 3 * (rb_idx + 1)] * rotation_jitter
+
+            def _compose_one(q, rv):
+                dq = _rotvec_to_quat(rv)
+                q_new = _quat_multiply(dq, _normalise_quat(q))
+                return _canonicalize_quat(_normalise_quat(q_new))
+
+            q_new = jax.vmap(_compose_one)(q_old, delta_rotvec)
+            positions = positions.at[:, o + 3 : o + 7].set(q_new)
 
         return positions
+
+    def suggested_rmh_proposal(self) -> Dict[str, float]:
+        """Default proposal scales for mixed rigid-body/flexible-bead systems."""
+        return {
+            "sigma_rb_trans": 1.5,
+            "sigma_rb_rot": 0.08,
+            "sigma_fb": 0.8,
+        }
+
+    def make_rmh_proposal_fn(
+        self,
+        sigma_rb_trans: float = 1.5,
+        sigma_rb_rot: float = 0.08,
+        sigma_fb: float = 0.8,
+        canonicalize_quat_sign: bool = True,
+    ):
+        """Build an RMH proposal over mixed Euclidean + SO(3) blocks."""
+        rb_offsets = tuple(int(rb["dof_offset"]) for rb in self.dof_space.rb_descriptors)
+        n_fb = int(self._fb_indices.shape[0])
+        fb_offset = int(self._fb_dof_offset)
+
+        def _proposal(rng_key: jax.Array, position: jnp.ndarray) -> jnp.ndarray:
+            proposed = jnp.asarray(position)
+            n_rb = len(rb_offsets)
+
+            if n_rb > 0:
+                keys = jax.random.split(rng_key, 2 * n_rb + 1)
+                for i, o in enumerate(rb_offsets):
+                    key_t = keys[2 * i]
+                    key_r = keys[2 * i + 1]
+
+                    t_new = proposed[o : o + 3] + jax.random.normal(key_t, shape=(3,)) * sigma_rb_trans
+                    q_old = _normalise_quat(proposed[o + 3 : o + 7])
+                    rotvec = jax.random.normal(key_r, shape=(3,)) * sigma_rb_rot
+                    dq = _rotvec_to_quat(rotvec)
+                    q_new = _normalise_quat(_quat_multiply(dq, q_old))
+                    if canonicalize_quat_sign:
+                        q_new = _canonicalize_quat(q_new)
+
+                    proposed = proposed.at[o : o + 3].set(t_new)
+                    proposed = proposed.at[o + 3 : o + 7].set(q_new)
+
+                key_fb = keys[-1]
+            else:
+                key_fb = rng_key
+
+            if n_fb > 0:
+                fb_noise = jax.random.normal(key_fb, shape=(3 * n_fb,)) * sigma_fb
+                proposed = proposed.at[fb_offset : fb_offset + 3 * n_fb].add(fb_noise)
+
+            return proposed
+
+        return _proposal
 
     def suggested_rmh_sigma(self) -> float:
         """

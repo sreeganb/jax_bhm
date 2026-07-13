@@ -363,7 +363,8 @@ def run_smc_on_imp_system(
     n_temperature_steps: int = 30,
     schedule: str = "geometric",
     kernel: str = "rmh",
-    rmh_sigma: Optional[float] = None,
+    rmh_sigma: Optional[ArrayLike] = None,
+    rmh_proposal_fn: Optional[Callable[[jax.Array, jnp.ndarray], jnp.ndarray]] = None,
     hmc_step_size: float = 0.05,
     hmc_num_integration_steps: int = 5,
     n_mcmc_steps: int = 10,
@@ -423,8 +424,19 @@ def run_smc_on_imp_system(
 
     if kernel == "rmh":
         sigma = rmh_sigma if rmh_sigma is not None else adapter.suggested_rmh_sigma()
+
+        proposal_fn = rmh_proposal_fn
+        if proposal_fn is None and hasattr(adapter, "make_rmh_proposal_fn"):
+            try:
+                proposal_cfg = adapter.suggested_rmh_proposal() if hasattr(adapter, "suggested_rmh_proposal") else {}
+                proposal_fn = adapter.make_rmh_proposal_fn(**proposal_cfg)
+            except Exception:
+                # Keep the wrapper backward-compatible: fall back to isotropic RMH.
+                proposal_fn = None
+
         state, info_history, best_positions, best_scores, lambdas = run_base_smc_rmh(
             rmh_sigma=sigma,
+            rmh_proposal_fn=proposal_fn,
             **common_kwargs,
         )
     elif kernel == "hmc":
@@ -453,7 +465,8 @@ def run_adaptive_smc_on_imp_system(
     max_temperature_steps: Optional[int] = None,
     n_mcmc_steps: int = 10,
     score_batch_size: Optional[int] = None,
-    rmh_sigma: Optional[float] = None,
+    rmh_sigma: Optional[ArrayLike] = None,
+    rmh_proposal_fn: Optional[Callable[[jax.Array, jnp.ndarray], jnp.ndarray]] = None,
     target_ess: float = 0.5,
     save_rmf3_path: Optional[str] = None,
     verbose: bool = True,
@@ -480,6 +493,15 @@ def run_adaptive_smc_on_imp_system(
 
     sigma = rmh_sigma if rmh_sigma is not None else adapter.suggested_rmh_sigma()
 
+    proposal_fn = rmh_proposal_fn
+    if proposal_fn is None and hasattr(adapter, "make_rmh_proposal_fn"):
+        try:
+            proposal_cfg = adapter.suggested_rmh_proposal() if hasattr(adapter, "suggested_rmh_proposal") else {}
+            proposal_fn = adapter.make_rmh_proposal_fn(**proposal_cfg)
+        except Exception:
+            # Keep the wrapper backward-compatible: fall back to isotropic RMH.
+            proposal_fn = None
+
     if verbose:
         print(f"\nInitial positions shape: {initial_positions.shape}")
         print(f"Example IMP score (particle 0): {adapter.imp_score(initial_positions[0]):.2f}")
@@ -499,6 +521,7 @@ def run_adaptive_smc_on_imp_system(
         rng_key=key_smc,
         n_mcmc_steps=n_mcmc_steps,
         rmh_sigma=sigma,
+        rmh_proposal_fn=proposal_fn,
         target_ess=target_ess,
         max_temperature_steps=max_temperature_steps,
         record_best=True,

@@ -1,4 +1,6 @@
 import os
+import sys
+import contextlib
 import numpy as np
 from pathlib import Path
 
@@ -29,6 +31,33 @@ from sampling.wrapper_imp_blackjax import (
     run_adaptive_smc_on_imp_system,
 )
 from sampling.imp_blackjax_adapter import IMPDOFSpace, IMPSMCAdapter
+
+
+class TeeStream:
+    """Write text to multiple streams at once."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+
+@contextlib.contextmanager
+def tee_to_log(log_path):
+    """Mirror stdout/stderr into a log file while preserving terminal output."""
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        tee = TeeStream(sys.stdout, log_file)
+        with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+            yield
 
 
 def prepare_sampler_output_dir(sampler_name):
@@ -319,7 +348,7 @@ def write_best_positions_to_rmf(root_hier, smc_adapter, best_positions, rmf_path
         )
 
 
-def build_smc_adapter_context(root_hier, dof, sf_imp, box_half_width):
+def build_smc_adapter_context(root_hier, dof, sf_imp, box_half_width, dof_mode="flex"):
     """Build SMC adapter plus hierarchy-to-JAX row mapping."""
     ji = sf_imp._get_jax()
     jm_initial = ji.get_jax_model()
@@ -341,7 +370,7 @@ def build_smc_adapter_context(root_hier, dof, sf_imp, box_half_width):
         print("ji does not expose particle indices; using coordinate-based leaf mapping.")
         leaf_rows = build_leaf_rows_from_coordinates(root_hier, jm_initial["xyz"], atol=1e-3)
 
-    dof_mode = "flex"
+    dof_mode = str(dof_mode).lower()
     smc_adapter = IMPSMCAdapter(
         IMPDOFSpace.from_imp(dof, ji, jm_initial, mode=dof_mode),
         ji.score_func,
@@ -405,6 +434,9 @@ def run_fixed_smc_case(
     dof,
     sf_imp,
     box_half_width,
+    dof_mode,
+    smc_debug,
+    smc_debug_stride,
     smc_best_trajectory_rmf,
     smc_final_rmf,
 ):
@@ -424,6 +456,7 @@ def run_fixed_smc_case(
         dof=dof,
         sf_imp=sf_imp,
         box_half_width=box_half_width,
+        dof_mode=dof_mode,
     )
 
     smc_state, smc_info, smc_best_pos, smc_best_scores, smc_lambdas = run_smc_on_imp_system(
@@ -438,6 +471,8 @@ def run_fixed_smc_case(
         score_batch_size=16,
         save_rmf3_path=None,
         verbose=True,
+        debug=smc_debug,
+        debug_stride=smc_debug_stride,
     )
 
     write_best_positions_to_rmf(
@@ -470,6 +505,9 @@ def run_adaptive_smc_case(
     dof,
     sf_imp,
     box_half_width,
+    dof_mode,
+    smc_debug,
+    smc_debug_stride,
     adaptive_smc_best_trajectory_rmf,
     adaptive_smc_final_rmf,
 ):
@@ -489,6 +527,7 @@ def run_adaptive_smc_case(
         dof=dof,
         sf_imp=sf_imp,
         box_half_width=box_half_width,
+        dof_mode=dof_mode,
     )
 
     state, info, best_pos, best_scores, lambdas = run_adaptive_smc_on_imp_system(
@@ -502,6 +541,8 @@ def run_adaptive_smc_case(
         score_batch_size=16,
         save_rmf3_path=None,
         verbose=True,
+        debug=smc_debug,
+        debug_stride=smc_debug_stride,
     )
 
     write_best_positions_to_rmf(
@@ -584,6 +625,11 @@ def main():
     box_half_width = 300.0
     box_sigma = 20.0
 
+    # SMC sampling mode: choose from {'flex', 'rigid', 'all'}.
+    smc_dof_mode = "flex"
+    smc_debug = True
+    smc_debug_stride = 10
+
     def log_prior_fn(flat):
         excess = jnp.maximum(jnp.abs(flat) - box_half_width, 0.0)
         return -0.5 * jnp.sum((excess / box_sigma) ** 2)
@@ -606,40 +652,50 @@ def main():
 
     print(f"Sampling dimension: {parameter_space.dim}")
 
-    run_rmh_case(
-        parameter_space=parameter_space,
-        log_posterior=log_posterior,
-        sf_imp=sf_imp,
-        root_hier=root_hier,
-        rmh_trajectory_rmf=rmh_trajectory_rmf,
-        rmh_final_rmf=rmh_final_rmf,
-    )
+    with tee_to_log(rmh_output_dir / "rmh_run.log"):
+        run_rmh_case(
+            parameter_space=parameter_space,
+            log_posterior=log_posterior,
+            sf_imp=sf_imp,
+            root_hier=root_hier,
+            rmh_trajectory_rmf=rmh_trajectory_rmf,
+            rmh_final_rmf=rmh_final_rmf,
+        )
 
-    run_fixed_smc_case(
-        root_hier=root_hier,
-        dof=dof,
-        sf_imp=sf_imp,
-        box_half_width=box_half_width,
-        smc_best_trajectory_rmf=smc_best_trajectory_rmf,
-        smc_final_rmf=smc_final_rmf,
-    )
+    with tee_to_log(smc_output_dir / "smc_run.log"):
+        run_fixed_smc_case(
+            root_hier=root_hier,
+            dof=dof,
+            sf_imp=sf_imp,
+            box_half_width=box_half_width,
+            dof_mode=smc_dof_mode,
+            smc_debug=smc_debug,
+            smc_debug_stride=smc_debug_stride,
+            smc_best_trajectory_rmf=smc_best_trajectory_rmf,
+            smc_final_rmf=smc_final_rmf,
+        )
 
-    run_adaptive_smc_case(
-        root_hier=root_hier,
-        dof=dof,
-        sf_imp=sf_imp,
-        box_half_width=box_half_width,
-        adaptive_smc_best_trajectory_rmf=adaptive_smc_best_trajectory_rmf,
-        adaptive_smc_final_rmf=adaptive_smc_final_rmf,
-    )
+    with tee_to_log(adaptive_smc_output_dir / "adaptive_smc_run.log"):
+        run_adaptive_smc_case(
+            root_hier=root_hier,
+            dof=dof,
+            sf_imp=sf_imp,
+            box_half_width=box_half_width,
+            dof_mode=smc_dof_mode,
+            smc_debug=smc_debug,
+            smc_debug_stride=smc_debug_stride,
+            adaptive_smc_best_trajectory_rmf=adaptive_smc_best_trajectory_rmf,
+            adaptive_smc_final_rmf=adaptive_smc_final_rmf,
+        )
 
-    run_replica_exchange_case(
-        m=m,
-        root_hier=root_hier,
-        dof=dof,
-        sf_imp=sf_imp,
-        rex_final_rmf=rex_final_rmf,
-    )
+    with tee_to_log(rex_output_dir / "rex_run.log"):
+        run_replica_exchange_case(
+            m=m,
+            root_hier=root_hier,
+            dof=dof,
+            sf_imp=sf_imp,
+            rex_final_rmf=rex_final_rmf,
+        )
     
 
 if __name__ == "__main__":

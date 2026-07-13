@@ -102,7 +102,8 @@ def run_base_smc_rmh(
     n_temperature_steps: int = 20,
     schedule: str = "linear",
     # RMH parameters (fixed)
-    rmh_sigma: float = 1.0,
+    rmh_sigma: float | jnp.ndarray = 1.0,
+    rmh_proposal_fn: Optional[Callable[[jax.Array, jnp.ndarray], jnp.ndarray]] = None,
     n_mcmc_steps: int = 10,
     # Resampling
     resampling_fn: Callable = resampling.systematic,
@@ -192,6 +193,8 @@ def run_base_smc_rmh(
     def _rmh_proposal(rng_key, position):
         return position + jax.random.normal(rng_key, shape=position.shape) * rmh_sigma
 
+    proposal_fn = rmh_proposal_fn if rmh_proposal_fn is not None else _rmh_proposal
+
     # ----- batched scoring for tracking ---------------------------------
     score_batched = batched_vmap(_safe_logp, batch_size=score_batch_size)
 
@@ -208,6 +211,10 @@ def run_base_smc_rmh(
         print(f"\nRunning BlackJAX Base SMC (RMH kernel)")
         print(f"  Particles: {n_particles}, Dims: {n_dims}")
         print(f"  RMH sigma: {rmh_sigma}")
+        print(
+            "  RMH proposal: "
+            f"{'custom (adapter-provided)' if rmh_proposal_fn is not None else 'isotropic Gaussian'}"
+        )
         print(f"  MCMC steps/temp: {n_mcmc_steps}")
         print(f"  Temperature steps: {n_temperature_steps}")
         print(f"  Score batch size: {score_batch_size}")
@@ -257,7 +264,7 @@ def run_base_smc_rmh(
                 def _body(carry, _):
                     k, s = carry
                     k, subk = jax.random.split(k)
-                    s, info = rmh_kernel(subk, s, _tempered_logdensity, _rmh_proposal)
+                    s, info = rmh_kernel(subk, s, _tempered_logdensity, proposal_fn)
                     return (k, s), info.is_accepted
                 (_, final_st), accepted = jax.lax.scan(_body, (key, st), jnp.arange(n_mcmc_steps))
                 return final_st.position, jnp.mean(accepted)

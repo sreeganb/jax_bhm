@@ -24,7 +24,8 @@ def run_tempered_smc(
     initial_positions: jnp.ndarray,
     rng_key: jax.Array,
     n_mcmc_steps: int = 10,
-    rmh_sigma: float = 1.0,
+    rmh_sigma: float | jnp.ndarray = 1.0,
+    rmh_proposal_fn: Callable[[jax.Array, jnp.ndarray], jnp.ndarray] | None = None,
     target_ess: float = 0.5,
     max_temperature_steps: int | None = None,
     record_best: bool = True,
@@ -55,6 +56,8 @@ def run_tempered_smc(
         Returns new position with same shape.
         """
         return position + jax.random.normal(rng_key, shape=position.shape) * rmh_sigma
+
+    proposal_distribution = rmh_proposal_fn if rmh_proposal_fn is not None else rmh_proposal_distribution
     
     # =========================================================================
     # STEP 2: Create the RMH kernel using blackjax
@@ -84,7 +87,7 @@ def run_tempered_smc(
         Returns:
             new_state, info
         """
-        return rmh_kernel(rng_key, state, logdensity_fn, rmh_proposal_distribution)
+        return rmh_kernel(rng_key, state, logdensity_fn, proposal_distribution)
     
     # =========================================================================
     # STEP 4: Define mcmc_init_fn
@@ -124,6 +127,10 @@ def run_tempered_smc(
     if verbose:
         print(f"Running BlackJAX Adaptive Tempered SMC")
         print(f"  Particles: {n_particles}, MCMC steps: {n_mcmc_steps}, σ: {rmh_sigma}")
+        print(
+            "  RMH proposal: "
+            f"{'custom (adapter-provided)' if rmh_proposal_fn is not None else 'isotropic Gaussian'}"
+        )
         print(f"  Target ESS: {target_ess:.0%}")
     
     # =========================================================================

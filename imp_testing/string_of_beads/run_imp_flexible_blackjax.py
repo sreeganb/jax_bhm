@@ -1,5 +1,6 @@
 import os
 import numpy as np
+from pathlib import Path
 
 # Some GPU/XLA builds report noisy GEMM autotuner mismatches for this workload.
 # Lowering autotune level avoids those warnings and favors stable kernels.
@@ -28,6 +29,26 @@ from sampling.wrapper_imp_blackjax import (
     run_adaptive_smc_on_imp_system,
 )
 from sampling.imp_blackjax_adapter import IMPDOFSpace, IMPSMCAdapter
+
+
+def prepare_sampler_output_dir(sampler_name):
+    """Create fresh '<sampler_name>_output' dir with old_* rollover policy."""
+    target_dir = Path.cwd() / f"{sampler_name}_output"
+    old_dir = target_dir.parent / f"old_{target_dir.name}"
+
+    if target_dir.exists():
+        if old_dir.exists():
+            timestamp = str(int(old_dir.stat().st_mtime_ns))
+            rolled_old_dir = target_dir.parent / f"{old_dir.name}_{timestamp}"
+            suffix = 1
+            while rolled_old_dir.exists():
+                rolled_old_dir = target_dir.parent / f"{old_dir.name}_{timestamp}_{suffix}"
+                suffix += 1
+            old_dir.rename(rolled_old_dir)
+        target_dir.rename(old_dir)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir
 
 
 def get_all_leaves(list_of_hs):
@@ -298,8 +319,266 @@ def write_best_positions_to_rmf(root_hier, smc_adapter, best_positions, rmf_path
         )
 
 
+def build_smc_adapter_context(root_hier, dof, sf_imp, box_half_width):
+    """Build SMC adapter plus hierarchy-to-JAX row mapping."""
+    ji = sf_imp._get_jax()
+    jm_initial = ji.get_jax_model()
+    ji_particle_indices = get_ji_particle_indices(ji, jm_initial)
+    n_jax_rows = int(np.asarray(jm_initial["xyz"]).shape[0])
+
+    if ji_particle_indices is not None:
+        leaves = IMP.atom.get_leaves(root_hier)
+        leaf_particle_indices = [int(p.get_index()) for p in leaves]
+        pid_to_jax_row = {int(pid): i for i, pid in enumerate(ji_particle_indices)}
+        missing = [pid for pid in leaf_particle_indices if pid not in pid_to_jax_row]
+        if missing:
+            raise RuntimeError(
+                "JAX mapping exists but does not cover all hierarchy leaves. "
+                f"First missing particle indices: {missing[:10]}"
+            )
+        leaf_rows = np.asarray([pid_to_jax_row[pid] for pid in leaf_particle_indices], dtype=np.int32)
+    else:
+        print("ji does not expose particle indices; using coordinate-based leaf mapping.")
+        leaf_rows = build_leaf_rows_from_coordinates(root_hier, jm_initial["xyz"], atol=1e-3)
+
+    dof_mode = "flex"
+    smc_adapter = IMPSMCAdapter(
+        IMPDOFSpace.from_imp(dof, ji, jm_initial, mode=dof_mode),
+        ji.score_func,
+        kT=1.0,
+        box_half_width=box_half_width,
+    )
+
+    rbs, beads = get_rbs_and_beads(root_hier)
+    print(
+        "SMC adapter context: "
+        f"mode={dof_mode}, sampled_flexible_beads={len(beads)}, "
+        f"rigid_bodies_fixed_in_score={len(rbs)}, "
+        f"jax_rows_scored={n_jax_rows}"
+    )
+    return smc_adapter, leaf_rows, n_jax_rows
+
+
+def run_rmh_case(parameter_space, log_posterior, sf_imp, root_hier, rmh_trajectory_rmf, rmh_final_rmf):
+    """Run RMH sampling and write trajectory/final snapshots."""
+    rmf_output, step_callback = make_rmf_step_callback(
+        root_hier,
+        rmf_path=str(rmh_trajectory_rmf),
+        write_stride=10,
+    )
+
+    result = run_rmh_on_imp_system(
+        parameter_space=parameter_space,
+        log_prob_fn=log_posterior,
+        rng_key=jax.random.PRNGKey(0),
+        n_steps=1000,
+        sigma=2.0,
+        step_callback=step_callback,
+        verbose=True,
+        debug=True,
+        debug_stride=50,
+    )
+
+    rmf_output.close_rmf(str(rmh_trajectory_rmf))
+
+    final_score = sf_imp.evaluate(False)
+    final_eval = log_posterior.evaluate(parameter_space.pack())
+    print("\nRMH completed.")
+    print(f"  Acceptance rate: {result.acceptance_rate:.2%}")
+    print(f"  Best log posterior: {np.max(result.log_probs):.6f}")
+    print(f"  Final IMP score: {final_score:.6f}")
+    print(
+        "  Final posterior components: "
+        f"score={final_eval.score:.6f}, "
+        f"log_prior={final_eval.log_prior:.6f}, "
+        f"log_posterior={final_eval.log_posterior:.6f}"
+    )
+
+    out = IMP.pmi.output.Output()
+    out.init_rmf(str(rmh_final_rmf), [root_hier])
+    out.write_rmf(str(rmh_final_rmf))
+    out.close_rmf(str(rmh_final_rmf))
+
+
+def run_fixed_smc_case(
+    root_hier,
+    dof,
+    sf_imp,
+    box_half_width,
+    smc_best_trajectory_rmf,
+    smc_final_rmf,
+):
+    """Run fixed-temperature-step SMC and write outputs."""
+    IMP.pmi.tools.shuffle_configuration(
+        root_hier,
+        max_translation=500,
+        avoidcollision_rb=False,
+        bounding_box=((-100, -100, 0), (100, 100, 100)),
+    )
+    print(f"Randomized IMP score before SMC: {sf_imp.evaluate(False):.4f}")
+
+    # Rebuild adapter from the current IMP coordinates so fixed rigid-body rows
+    # in flex-only mode are synchronized with the exact shuffled conformation.
+    smc_adapter, leaf_rows, n_jax_rows = build_smc_adapter_context(
+        root_hier=root_hier,
+        dof=dof,
+        sf_imp=sf_imp,
+        box_half_width=box_half_width,
+    )
+
+    smc_state, smc_info, smc_best_pos, smc_best_scores, smc_lambdas = run_smc_on_imp_system(
+        adapter=smc_adapter,
+        rng_key=jax.random.PRNGKey(1),
+        n_particles=100,
+        n_temperature_steps=100,
+        schedule="geometric",
+        kernel="rmh",
+        rmh_sigma=2.0,
+        n_mcmc_steps=50,
+        score_batch_size=16,
+        save_rmf3_path=None,
+        verbose=True,
+    )
+
+    write_best_positions_to_rmf(
+        root_hier=root_hier,
+        smc_adapter=smc_adapter,
+        best_positions=smc_best_pos,
+        rmf_path=str(smc_best_trajectory_rmf),
+        leaf_rows=leaf_rows,
+        n_jax_rows=n_jax_rows,
+    )
+
+    smc_final_score = sf_imp.evaluate(False)
+    finite_best = np.asarray(smc_best_scores, dtype=float)
+    finite_best = finite_best[np.isfinite(finite_best)]
+    print("\nSMC completed.")
+    if finite_best.size > 0:
+        print(f"  Best log posterior (finite): {float(np.max(finite_best)):.6f}")
+    else:
+        print("  Best log posterior (finite): none")
+    print(f"  Final IMP score: {smc_final_score:.6f}")
+
+    out = IMP.pmi.output.Output()
+    out.init_rmf(str(smc_final_rmf), [root_hier])
+    out.write_rmf(str(smc_final_rmf))
+    out.close_rmf(str(smc_final_rmf))
+
+
+def run_adaptive_smc_case(
+    root_hier,
+    dof,
+    sf_imp,
+    box_half_width,
+    adaptive_smc_best_trajectory_rmf,
+    adaptive_smc_final_rmf,
+):
+    """Run adaptive-step SMC and write outputs."""
+    IMP.pmi.tools.shuffle_configuration(
+        root_hier,
+        max_translation=500,
+        avoidcollision_rb=False,
+        bounding_box=((-100, -100, 0), (100, 100, 100)),
+    )
+    print(f"Randomized IMP score before SMC: {sf_imp.evaluate(False):.4f}")
+
+    # Rebuild adapter from the current IMP coordinates so fixed rigid-body rows
+    # in flex-only mode are synchronized with the exact shuffled conformation.
+    smc_adapter, leaf_rows, n_jax_rows = build_smc_adapter_context(
+        root_hier=root_hier,
+        dof=dof,
+        sf_imp=sf_imp,
+        box_half_width=box_half_width,
+    )
+
+    state, info, best_pos, best_scores, lambdas = run_adaptive_smc_on_imp_system(
+        adapter=smc_adapter,
+        rng_key=jax.random.PRNGKey(2),
+        n_particles=100,
+        max_temperature_steps=200,
+        target_ess=0.5,
+        rmh_sigma=2.0,
+        n_mcmc_steps=50,
+        score_batch_size=16,
+        save_rmf3_path=None,
+        verbose=True,
+    )
+
+    write_best_positions_to_rmf(
+        root_hier=root_hier,
+        smc_adapter=smc_adapter,
+        best_positions=best_pos,
+        rmf_path=str(adaptive_smc_best_trajectory_rmf),
+        leaf_rows=leaf_rows,
+        n_jax_rows=n_jax_rows,
+    )
+
+    smc_final_score = sf_imp.evaluate(False)
+    finite_best = np.asarray(best_scores, dtype=float)
+    finite_best = finite_best[np.isfinite(finite_best)]
+    print("\nAdaptive SMC completed.")
+    if finite_best.size > 0:
+        print(f"  Best log posterior (finite): {float(np.max(finite_best)):.6f}")
+    else:
+        print("  Best log posterior (finite): none")
+    print(f"  Final IMP score: {smc_final_score:.6f}")
+
+    out = IMP.pmi.output.Output()
+    out.init_rmf(str(adaptive_smc_final_rmf), [root_hier])
+    out.write_rmf(str(adaptive_smc_final_rmf))
+    out.close_rmf(str(adaptive_smc_final_rmf))
+
+
+def run_replica_exchange_case(m, root_hier, dof, sf_imp, rex_final_rmf):
+    """Run IMP ReplicaExchange with flexible-only movers and save snapshot."""
+    IMP.pmi.tools.shuffle_configuration(
+        root_hier,
+        max_translation=500,
+        avoidcollision_rb=False,
+        bounding_box=((-100, -100, 0), (100, 100, 100)),
+    )
+    print(f"Randomized IMP score before ReplicaExchange: {sf_imp.evaluate(False):.4f}")
+
+    all_movers = list(dof.get_movers())
+    flexible_movers = [m for m in all_movers if isinstance(m, IMP.core.BallMover)]
+    print(
+        f"Running IMP ReplicaExchange with flexible-only movers: "
+        f"{len(flexible_movers)} of {len(all_movers)} total movers"
+    )
+
+    rex = IMP.pmi.macros.ReplicaExchange(
+        m,
+        root_hier=root_hier,
+        monte_carlo_sample_objects=flexible_movers,
+        output_objects=[],
+        number_of_frames=500,
+    )
+    rex.execute_macro()
+
+    out = IMP.pmi.output.Output()
+    out.init_rmf(str(rex_final_rmf), [root_hier])
+    out.write_rmf(str(rex_final_rmf))
+    out.close_rmf(str(rex_final_rmf))
+    print(f"Final IMP score after ReplicaExchange: {sf_imp.evaluate(False):.4f}")
+
+
 def main():
     m, root_hier, dof, sf_imp, flexible_particle_indices = build_imp_system()
+
+    rmh_output_dir = prepare_sampler_output_dir("rmh")
+    smc_output_dir = prepare_sampler_output_dir("smc")
+    adaptive_smc_output_dir = prepare_sampler_output_dir("adaptive_smc")
+    rex_output_dir = prepare_sampler_output_dir("rex")
+
+    rmh_trajectory_rmf = rmh_output_dir / "rmh_flexible_trajectory.rmf3"
+    rmh_final_rmf = rmh_output_dir / "rmh_flexible_final.rmf3"
+    smc_best_trajectory_rmf = smc_output_dir / "smc_flexible_best_trajectory.rmf3"
+    smc_final_rmf = smc_output_dir / "smc_flexible_final.rmf3"
+    adaptive_smc_best_trajectory_rmf = (
+        adaptive_smc_output_dir / "adaptive_smc_flexible_best_trajectory.rmf3"
+    )
+    adaptive_smc_final_rmf = adaptive_smc_output_dir / "adaptive_smc_flexible_final.rmf3"
+    rex_final_rmf = rex_output_dir / "replica_exchange_flexible_final.rmf3"
 
     # Optional weak box prior to avoid unconstrained drift.
     box_half_width = 300.0
@@ -327,204 +606,40 @@ def main():
 
     print(f"Sampling dimension: {parameter_space.dim}")
 
-    rmf_output, step_callback = make_rmf_step_callback(
-        root_hier,
-        rmf_path="rmh_flexible_trajectory.rmf3",
-        write_stride=10,
-    )
-
-    rng_key = jax.random.PRNGKey(0)
-
-    result = run_rmh_on_imp_system(
+    run_rmh_case(
         parameter_space=parameter_space,
-        log_prob_fn=log_posterior,
-        rng_key=rng_key,
-        n_steps=1000,
-        sigma=2.0,
-        step_callback=step_callback,
-        verbose=True,
-        debug=True,
-        debug_stride=50,
+        log_posterior=log_posterior,
+        sf_imp=sf_imp,
+        root_hier=root_hier,
+        rmh_trajectory_rmf=rmh_trajectory_rmf,
+        rmh_final_rmf=rmh_final_rmf,
     )
 
-    rmf_output.close_rmf("rmh_flexible_trajectory.rmf3")
-
-    final_score = sf_imp.evaluate(False)
-    final_eval = log_posterior.evaluate(parameter_space.pack())
-    print("\nRMH completed.")
-    print(f"  Acceptance rate: {result.acceptance_rate:.2%}")
-    print(f"  Best log posterior: {np.max(result.log_probs):.6f}")
-    print(f"  Final IMP score: {final_score:.6f}")
-    print(
-        "  Final posterior components: "
-        f"score={final_eval.score:.6f}, "
-        f"log_prior={final_eval.log_prior:.6f}, "
-        f"log_posterior={final_eval.log_posterior:.6f}"
-    )
-
-    # Save final coordinates snapshot.
-    out = IMP.pmi.output.Output()
-    out.init_rmf("rmh_flexible_final.rmf3", [root_hier])
-    out.write_rmf("rmh_flexible_final.rmf3")
-    out.close_rmf("rmh_flexible_final.rmf3")
-    
-    # Re-randomize before SMC so it does not start from RMH's final state.
-    IMP.pmi.tools.shuffle_configuration(
-        root_hier,
-        max_translation=500,
-        avoidcollision_rb=False,
-        bounding_box=((-100, -100, 0), (100, 100, 100)),
-    )
-    print(f"Randomized IMP score before SMC: {sf_imp.evaluate(False):.4f}")
-
-    # Build the JAX-backed adapter used by the stand-alone SMC sampler.
-    ji = sf_imp._get_jax()
-    jm_initial = ji.get_jax_model()
-    ji_particle_indices = get_ji_particle_indices(ji, jm_initial)
-    n_jax_rows = int(np.asarray(jm_initial["xyz"]).shape[0])
-
-    if ji_particle_indices is not None:
-        leaves = IMP.atom.get_leaves(root_hier)
-        leaf_particle_indices = [int(p.get_index()) for p in leaves]
-        pid_to_jax_row = {int(pid): i for i, pid in enumerate(ji_particle_indices)}
-        missing = [pid for pid in leaf_particle_indices if pid not in pid_to_jax_row]
-        if missing:
-            raise RuntimeError(
-                "JAX mapping exists but does not cover all hierarchy leaves. "
-                f"First missing particle indices: {missing[:10]}"
-            )
-        leaf_rows = np.asarray([pid_to_jax_row[pid] for pid in leaf_particle_indices], dtype=np.int32)
-    else:
-        print("ji does not expose particle indices; using coordinate-based leaf mapping.")
-        leaf_rows = build_leaf_rows_from_coordinates(root_hier, jm_initial["xyz"], atol=1e-3)
-
-    smc_adapter = IMPSMCAdapter(
-        IMPDOFSpace.from_imp(dof, ji, jm_initial),
-        ji.score_func,
-        kT=1.0,
+    run_fixed_smc_case(
+        root_hier=root_hier,
+        dof=dof,
+        sf_imp=sf_imp,
         box_half_width=box_half_width,
+        smc_best_trajectory_rmf=smc_best_trajectory_rmf,
+        smc_final_rmf=smc_final_rmf,
     )
 
-    # Run SMC from the newly randomized state.
-    smc_state, smc_info, smc_best_pos, smc_best_scores, smc_lambdas = run_smc_on_imp_system(
-        adapter=smc_adapter,
-        rng_key=jax.random.PRNGKey(1),
-        n_particles=100,
-        n_temperature_steps=100,
-        schedule="geometric",
-        kernel="rmh",
-        rmh_sigma=2.0,
-        n_mcmc_steps=50,
-        score_batch_size=16,
-        save_rmf3_path=None,
-        verbose=True,
-    )
-
-    # Write SMC trajectory via PMI output for best compatibility with Chimera.
-    write_best_positions_to_rmf(
+    run_adaptive_smc_case(
         root_hier=root_hier,
-        smc_adapter=smc_adapter,
-        best_positions=smc_best_pos,
-        rmf_path="smc_flexible_best_trajectory.rmf3",
-        leaf_rows=leaf_rows,
-        n_jax_rows=n_jax_rows,
+        dof=dof,
+        sf_imp=sf_imp,
+        box_half_width=box_half_width,
+        adaptive_smc_best_trajectory_rmf=adaptive_smc_best_trajectory_rmf,
+        adaptive_smc_final_rmf=adaptive_smc_final_rmf,
     )
 
-    smc_final_score = sf_imp.evaluate(False)
-    finite_best = np.asarray(smc_best_scores, dtype=float)
-    finite_best = finite_best[np.isfinite(finite_best)]
-    print("\nSMC completed.")
-    if finite_best.size > 0:
-        print(f"  Best log posterior (finite): {float(np.max(finite_best)):.6f}")
-    else:
-        print("  Best log posterior (finite): none")
-    print(f"  Final IMP score: {smc_final_score:.6f}")
-
-    # Save the final SMC configuration snapshot for convenience.
-    out = IMP.pmi.output.Output()
-    out.init_rmf("smc_flexible_final.rmf3", [root_hier])
-    out.write_rmf("smc_flexible_final.rmf3")
-    out.close_rmf("smc_flexible_final.rmf3")
-
-    # Re-randomize before SMC so it does not start from RMH's final state.
-    IMP.pmi.tools.shuffle_configuration(
-        root_hier,
-        max_translation=500,
-        avoidcollision_rb=False,
-        bounding_box=((-100, -100, 0), (100, 100, 100)),
-    )
-    print(f"Randomized IMP score before SMC: {sf_imp.evaluate(False):.4f}")
-
-    state, info, best_pos, best_scores, lambdas = run_adaptive_smc_on_imp_system(
-        adapter=smc_adapter,
-        rng_key=jax.random.PRNGKey(2),
-        n_particles=100,
-        max_temperature_steps=200,
-        target_ess=0.5,
-        rmh_sigma=2.0,
-        n_mcmc_steps=50,
-        score_batch_size=16,
-        save_rmf3_path=None,
-        verbose=True,
-    )
-    
-     # Write SMC trajectory via PMI output for best compatibility with Chimera.
-    write_best_positions_to_rmf(
+    run_replica_exchange_case(
+        m=m,
         root_hier=root_hier,
-        smc_adapter=smc_adapter,
-        best_positions=best_pos,
-        rmf_path="adaptive_smc_flexible_best_trajectory.rmf3",
-        leaf_rows=leaf_rows,
-        n_jax_rows=n_jax_rows,
+        dof=dof,
+        sf_imp=sf_imp,
+        rex_final_rmf=rex_final_rmf,
     )
-
-    smc_final_score = sf_imp.evaluate(False)
-    finite_best = np.asarray(best_scores, dtype=float)
-    finite_best = finite_best[np.isfinite(finite_best)]
-    print("\nAdaptive SMC completed.")
-    if finite_best.size > 0:
-        print(f"  Best log posterior (finite): {float(np.max(finite_best)):.6f}")
-    else:
-        print("  Best log posterior (finite): none")
-    print(f"  Final IMP score: {smc_final_score:.6f}")
-
-    # Save the final Adaptive SMC configuration snapshot for convenience.
-    out = IMP.pmi.output.Output()
-    out.init_rmf("adaptive_smc_flexible_final.rmf3", [root_hier])
-    out.write_rmf("adaptive_smc_flexible_final.rmf3")
-    out.close_rmf("adaptive_smc_flexible_final.rmf3")
-
-    # Finally, run IMP's own ReplicaExchange using only flexible-bead movers.
-    IMP.pmi.tools.shuffle_configuration(
-        root_hier,
-        max_translation=500,
-        avoidcollision_rb=False,
-        bounding_box=((-100, -100, 0), (100, 100, 100)),
-    )
-    print(f"Randomized IMP score before ReplicaExchange: {sf_imp.evaluate(False):.4f}")
-
-    all_movers = list(dof.get_movers())
-    flexible_movers = [m for m in all_movers if isinstance(m, IMP.core.BallMover)]
-    print(
-        f"Running IMP ReplicaExchange with flexible-only movers: "
-        f"{len(flexible_movers)} of {len(all_movers)} total movers"
-    )
-
-    rex = IMP.pmi.macros.ReplicaExchange(
-        m,
-        root_hier=root_hier,
-        monte_carlo_sample_objects=flexible_movers,
-        output_objects=[],
-        number_of_frames=500,
-    )
-    rex.execute_macro()
-
-    # Save a post-ReplicaExchange snapshot.
-    out = IMP.pmi.output.Output()
-    out.init_rmf("replica_exchange_flexible_final.rmf3", [root_hier])
-    out.write_rmf("replica_exchange_flexible_final.rmf3")
-    out.close_rmf("replica_exchange_flexible_final.rmf3")
-    print(f"Final IMP score after ReplicaExchange: {sf_imp.evaluate(False):.4f}")
     
 
 if __name__ == "__main__":

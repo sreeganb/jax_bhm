@@ -370,6 +370,8 @@ def run_smc_on_imp_system(
     score_batch_size: int = 32,
     save_rmf3_path: Optional[str] = None,
     verbose: bool = True,
+    debug: bool = False,
+    debug_stride: int = 1,
 ):
     """
     Run a stand-alone fixed-schedule SMC sampler on an IMP/JAX adapter.
@@ -415,6 +417,8 @@ def run_smc_on_imp_system(
         record_best=True,
         verbose=verbose,
         score_batch_size=score_batch_size,
+        debug=debug,
+        debug_stride=debug_stride,
     )
 
     if kernel == "rmh":
@@ -453,6 +457,8 @@ def run_adaptive_smc_on_imp_system(
     target_ess: float = 0.5,
     save_rmf3_path: Optional[str] = None,
     verbose: bool = True,
+    debug: bool = False,
+    debug_stride: int = 1,
 ):
     """
     Run BlackJAX adaptive tempered SMC on an IMP/JAX adapter.
@@ -497,6 +503,8 @@ def run_adaptive_smc_on_imp_system(
         max_temperature_steps=max_temperature_steps,
         record_best=True,
         verbose=verbose,
+        debug=debug,
+        debug_stride=debug_stride,
     )
 
     if save_rmf3_path is not None and best_positions is not None:

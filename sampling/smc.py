@@ -29,6 +29,8 @@ def run_tempered_smc(
     max_temperature_steps: int | None = None,
     record_best: bool = True,
     verbose: bool = True,
+    debug: bool = False,
+    debug_stride: int = 1,
 ) -> Tuple[Any, List, np.ndarray, np.ndarray, np.ndarray]:
     """
     Run BlackJAX adaptive tempered SMC with RMH mutation kernel.
@@ -204,6 +206,14 @@ def run_tempered_smc(
                 f"Step {step_count:3d} | λ = {float(state.tempering_param):.4f} | "
                 f"Best: {best_scores[-1]:.2f} | Mean: {mean_score:.2f} | "
                 f"Move: {mean_movement:.2f}"
+            )
+
+        if debug and (step_count % max(debug_stride, 1) == 0):
+            scores = jax.vmap(log_prob_fn)(state.particles)
+            n_bad = int(scores.shape[0] - jnp.sum(jnp.isfinite(scores)))
+            print(
+                f"  [debug] step={step_count:3d} lambda={float(state.tempering_param):.4f} "
+                f"non-finite logp particles: {n_bad}/{scores.shape[0]}"
             )
     
     dt = time.time() - t0

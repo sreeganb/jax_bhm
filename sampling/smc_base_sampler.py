@@ -110,6 +110,8 @@ def run_base_smc_rmh(
     record_best: bool = True,
     verbose: bool = True,
     score_batch_size: int = 16,
+    debug: bool = False,
+    debug_stride: int = 1,
 ) -> Tuple[Any, List, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Run base SMC with a fixed temperature schedule and RMH mutations.
@@ -289,12 +291,14 @@ def run_base_smc_rmh(
             best_positions.append(np.array(pos))
             best_scores.append(float(score))
 
-        if verbose:
-            # Report how many particles have non-finite log posterior at this temperature.
+        if debug and (step_idx % max(debug_stride, 1) == 0):
+            # Report non-finite diagnostics only in debug mode to avoid noisy output.
             finite_mask = jnp.isfinite(jax.vmap(log_prob_fn)(state.particles))
             n_bad = int(state.particles.shape[0] - jnp.sum(finite_mask))
-            if n_bad > 0:
-                print(f"  [stability] non-finite logp particles: {n_bad}/{state.particles.shape[0]}")
+            print(
+                f"  [debug] step={step_idx:3d} lambda={lam_curr:.4f} "
+                f"non-finite logp particles: {n_bad}/{state.particles.shape[0]}"
+            )
 
         if verbose:
             print(
@@ -344,6 +348,8 @@ def run_base_smc_hmc(
     record_best: bool = True,
     verbose: bool = True,
     score_batch_size: int = 16,
+    debug: bool = False,
+    debug_stride: int = 1,
 ) -> Tuple[Any, List, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Run base SMC with a fixed temperature schedule and HMC mutations.
@@ -487,6 +493,14 @@ def run_base_smc_hmc(
                 f"λ = {lam_curr:.4f} | "
                 f"Best: {best_scores[-1]:.2f} | "
                 f"Mean: {float(mean_score):.2f}"
+            )
+
+        if debug and (step_idx % max(debug_stride, 1) == 0):
+            finite_mask = jnp.isfinite(jax.vmap(log_prob_fn)(state.particles))
+            n_bad = int(state.particles.shape[0] - jnp.sum(finite_mask))
+            print(
+                f"  [debug] step={step_idx:3d} lambda={lam_curr:.4f} "
+                f"non-finite logp particles: {n_bad}/{state.particles.shape[0]}"
             )
 
     dt = time.perf_counter() - t0

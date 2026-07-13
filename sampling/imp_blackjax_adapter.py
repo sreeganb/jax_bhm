@@ -412,7 +412,8 @@ class IMPDOFSpace:
     @staticmethod
     def from_imp(dof: IMP.pmi.dof.DegreesOfFreedom,
                  ji,
-                 jm_initial: dict) -> "IMPDOFSpace":
+                 jm_initial: dict,
+                 mode: str = "all") -> "IMPDOFSpace":
         """
         Build a DOF descriptor from an already-constructed IMP DOF object
         and the corresponding IMP JAX interface `ji`.
@@ -422,7 +423,15 @@ class IMPDOFSpace:
         dof : IMP.pmi.dof.DegreesOfFreedom
         ji  : result of sf_imp._get_jax()
         jm_initial : dict returned by ji.get_jax_model()
+        mode : {'all', 'flex', 'rigid'}
+            DOF selection mode. 'all' preserves existing behavior.
         """
+        mode = str(mode).lower()
+        if mode not in {"all", "flex", "rigid"}:
+            raise ValueError(
+                f"Invalid mode={mode!r}; expected one of 'all', 'flex', 'rigid'."
+            )
+
         base_xyz = np.array(jm_initial["xyz"])  # (N, 3)
 
         # Build particle-id -> jax-index map with IMP API compatibility.
@@ -435,21 +444,26 @@ class IMPDOFSpace:
         else:
             pid_to_jax = _build_particle_index_map_by_coordinates(dof, base_xyz)
 
-        rb_descriptors, handled, dof_offset = _extract_rb_info(
-            dof, base_xyz, pid_to_jax
-        )
+        if mode in {"all", "rigid"}:
+            rb_descriptors, handled, dof_offset = _extract_rb_info(
+                dof, base_xyz, pid_to_jax
+            )
+        else:
+            # Flexible-only mode: no rigid-body parameter blocks.
+            rb_descriptors, handled, dof_offset = [], set(), 0
 
         # Flexible bead movers
         fb_jax_indices = []
-        fb_movers = [m for m in dof.get_movers()
-                     if isinstance(m, IMP.core.BallMover)]
-        for mover in fb_movers:
-            for p in _get_ball_mover_particles(mover):
-                pid = p.get_index()
-                if pid in pid_to_jax:
-                    jax_idx = pid_to_jax[pid]
-                    if jax_idx not in handled:
-                        fb_jax_indices.append(jax_idx)
+        if mode in {"all", "flex"}:
+            fb_movers = [m for m in dof.get_movers()
+                         if isinstance(m, IMP.core.BallMover)]
+            for mover in fb_movers:
+                for p in _get_ball_mover_particles(mover):
+                    pid = p.get_index()
+                    if pid in pid_to_jax:
+                        jax_idx = pid_to_jax[pid]
+                        if jax_idx not in handled:
+                            fb_jax_indices.append(jax_idx)
 
         n_fb = len(fb_jax_indices)
         n_dof = dof_offset + 3 * n_fb
@@ -737,76 +751,20 @@ def run_smc_on_imp_system(
     score_batch_size: int = 32,
     verbose: bool = True,
 ):
-    """
-    High-level wrapper: sample an IMP system with BlackJAX base SMC.
+    """Compatibility forwarder to the canonical wrapper entrypoint."""
+    from .wrapper_imp_blackjax import run_smc_on_imp_system as _run_smc
 
-    Parameters
-    ----------
-    adapter : IMPSMCAdapter
-    rng_key : jax.Array
-    n_particles : int
-        Number of SMC particles (population size).
-    n_temperature_steps : int
-        Number of tempering steps (lambda 0 → 1).
-    schedule : str
-        'linear', 'geometric', or 'sigmoid'.
-    kernel : str
-        'rmh' or 'hmc'.
-    rmh_sigma : float | None
-        RMH step size; if None uses adapter.suggested_rmh_sigma().
-    hmc_step_size : float
-    hmc_num_integration_steps : int
-    n_mcmc_steps : int
-        MCMC sweeps per SMC step.
-    score_batch_size : int
-        Batch size for particle scoring (memory control).
-    verbose : bool
-
-    Returns
-    -------
-    state, info_history, best_positions, best_scores, lambdas
-        Same as smc_base_sampler.run_base_smc_rmh / run_base_smc_hmc.
-    """
-    # Deferred import to avoid circular dependency.
-    from .smc_base_sampler import run_base_smc_rmh, run_base_smc_hmc
-
-    if verbose:
-        print(adapter.dof_summary())
-
-    key_init, key_smc = jax.random.split(rng_key)
-    initial_positions = adapter.sample_prior(
+    return _run_smc(
+        adapter=adapter,
+        rng_key=rng_key,
         n_particles=n_particles,
-        rng_key=key_init,
-        translation_sigma=150.0,
-    )
-
-    if verbose:
-        print(f"\nInitial positions shape: {initial_positions.shape}")
-        example_score = adapter.imp_score(initial_positions[0])
-        print(f"Example IMP score (particle 0): {example_score:.2f}")
-
-    common_kwargs = dict(
-        log_prior_fn=adapter.log_prior,
-        log_likelihood_fn=adapter.log_likelihood,
-        log_prob_fn=adapter.log_prob,
-        initial_positions=initial_positions,
-        rng_key=key_smc,
         n_temperature_steps=n_temperature_steps,
         schedule=schedule,
+        kernel=kernel,
+        rmh_sigma=rmh_sigma,
+        hmc_step_size=hmc_step_size,
+        hmc_num_integration_steps=hmc_num_integration_steps,
         n_mcmc_steps=n_mcmc_steps,
-        record_best=True,
-        verbose=verbose,
         score_batch_size=score_batch_size,
+        verbose=verbose,
     )
-
-    if kernel == "rmh":
-        sigma = rmh_sigma if rmh_sigma is not None else adapter.suggested_rmh_sigma()
-        return run_base_smc_rmh(rmh_sigma=sigma, **common_kwargs)
-    elif kernel == "hmc":
-        return run_base_smc_hmc(
-            hmc_step_size=hmc_step_size,
-            hmc_num_integration_steps=hmc_num_integration_steps,
-            **common_kwargs,
-        )
-    else:
-        raise ValueError(f"Unknown kernel '{kernel}'. Choose 'rmh' or 'hmc'.")

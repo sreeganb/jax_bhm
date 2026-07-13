@@ -91,11 +91,13 @@ def build_imp_system():
             print(f"  {mol.get_name()} : {len(leaves)} bead(s)")
 
     molecules = bs.get_molecules()[0]
+    connectivity_wrappers = []
     for mol_names in molecules:
         for mol in molecules[mol_names]:
             cr = IMP.pmi.restraints.stereochemistry.ConnectivityRestraint(mol)
             cr.set_label(mol.get_name())
             cr.add_to_model()
+            connectivity_wrappers.append(cr)
             print(f"Added connectivity restraint for molecule: {mol.get_name()}")
 
     # Add matched restraints for residue pairs: 1-1, 2-2, ..., 11-11.
@@ -150,7 +152,26 @@ def build_imp_system():
     out.write_rmf("shuffled_particles.rmf3")
     out.close_rmf("shuffled_particles.rmf3")
 
-    sf_imp = IMP.core.RestraintsScoringFunction(distance_restraints)
+    # PMI restraints are wrappers; RestraintsScoringFunction needs raw IMP restraints.
+    connectivity_restraints = []
+    for cr in connectivity_wrappers:
+        if hasattr(cr, "get_restraint"):
+            connectivity_restraints.append(cr.get_restraint())
+        elif hasattr(cr, "get_restraint_set"):
+            connectivity_restraints.append(cr.get_restraint_set())
+        else:
+            raise TypeError(
+                "ConnectivityRestraint object has no get_restraint()/get_restraint_set() method. "
+                "Cannot extract underlying IMP restraint."
+            )
+
+    all_restraints = [*connectivity_restraints, *distance_restraints]
+    sf_imp = IMP.core.RestraintsScoringFunction(all_restraints)
+    print(
+        "Scoring function contains "
+        f"{len(connectivity_restraints)} connectivity restraint(s) and "
+        f"{len(distance_restraints)} explicit distance restraint(s)."
+    )
     print(f"Initial shuffled IMP score: {sf_imp.evaluate(False):.4f}")
 
     # Keep rigid-body bookkeeping, but we only sample beads.
@@ -194,6 +215,14 @@ def main():
         log_prior_fn=log_prior_fn,
     )
 
+    initial_eval = log_posterior.evaluate(parameter_space.pack())
+    print(
+        "Initial posterior components: "
+        f"score={initial_eval.score:.6f}, "
+        f"log_prior={initial_eval.log_prior:.6f}, "
+        f"log_posterior={initial_eval.log_posterior:.6f}"
+    )
+
     print(f"Sampling dimension: {parameter_space.dim}")
 
     rmf_output, step_callback = make_rmf_step_callback(
@@ -208,19 +237,28 @@ def main():
         parameter_space=parameter_space,
         log_prob_fn=log_posterior,
         rng_key=rng_key,
-        n_steps=1000,
+        n_steps=5000,
         sigma=2.0,
         step_callback=step_callback,
         verbose=True,
+        debug=True,
+        debug_stride=50,
     )
 
     rmf_output.close_rmf("rmh_flexible_trajectory.rmf3")
 
     final_score = sf_imp.evaluate(False)
+    final_eval = log_posterior.evaluate(parameter_space.pack())
     print("\nRMH completed.")
     print(f"  Acceptance rate: {result.acceptance_rate:.2%}")
     print(f"  Best log posterior: {np.max(result.log_probs):.6f}")
     print(f"  Final IMP score: {final_score:.6f}")
+    print(
+        "  Final posterior components: "
+        f"score={final_eval.score:.6f}, "
+        f"log_prior={final_eval.log_prior:.6f}, "
+        f"log_posterior={final_eval.log_posterior:.6f}"
+    )
 
     # Save final coordinates snapshot.
     out = IMP.pmi.output.Output()

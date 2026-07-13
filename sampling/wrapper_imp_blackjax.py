@@ -121,6 +121,13 @@ class RMHResult:
     acceptance_rate: float
 
 
+@dataclass
+class DebugEvaluation:
+    score: float
+    log_prior: float
+    log_posterior: float
+
+
 class IMPLogPosterior:
     """
     Log-posterior adapter for BlackJAX.
@@ -142,10 +149,19 @@ class IMPLogPosterior:
         self.log_prior_fn = log_prior_fn
 
     def __call__(self, flat: jnp.ndarray) -> jnp.ndarray:
+        evaluation = self.evaluate(flat)
+        return jnp.asarray(evaluation.log_posterior, dtype=jnp.float32)
+
+    def evaluate(self, flat: jnp.ndarray) -> DebugEvaluation:
         self.parameter_space.unpack(flat)
         score = float(self.score_fn())
-        lp = jnp.asarray(0.0) if self.log_prior_fn is None else self.log_prior_fn(flat)
-        return lp - jnp.asarray(score / self.temperature)
+        log_prior = 0.0 if self.log_prior_fn is None else float(self.log_prior_fn(flat))
+        log_posterior = log_prior - (score / self.temperature)
+        return DebugEvaluation(
+            score=score,
+            log_prior=log_prior,
+            log_posterior=log_posterior,
+        )
 
 
 def create_rmh_kernel(log_prob_fn: Callable[[jnp.ndarray], jnp.ndarray], sigma: ArrayLike):
@@ -169,6 +185,9 @@ def run_rmh_on_imp_system(
     initial_position: Optional[jnp.ndarray] = None,
     step_callback: Optional[Callable[[int, np.ndarray, float, bool], None]] = None,
     verbose: bool = True,
+    debug: bool = False,
+    debug_stride: int = 1,
+    debug_tolerance: float = 1e-5,
 ) -> RMHResult:
     """
     Run step-by-step RMH and keep IMP in sync with accepted states.
@@ -189,6 +208,14 @@ def run_rmh_on_imp_system(
         Starting point. If None, reads current IMP coordinates.
     step_callback:
         Optional callback(step, position, log_prob, is_accepted).
+    debug:
+        If True, periodically recompute the IMP-backed log posterior from the
+        current state and print detailed consistency diagnostics.
+    debug_stride:
+        Print debug output every this many steps when debug=True.
+    debug_tolerance:
+        Warn if stored BlackJAX logdensity and fresh recomputation differ by
+        more than this amount.
     """
     kernel = create_rmh_kernel(log_prob_fn, sigma)
     x0 = parameter_space.pack() if initial_position is None else jnp.asarray(initial_position)
@@ -201,6 +228,21 @@ def run_rmh_on_imp_system(
 
     if verbose:
         print(f"Running RMH for {n_steps} steps in {parameter_space.dim} dimensions.")
+
+    previous_position = np.asarray(x0)
+    if debug:
+        if not hasattr(log_prob_fn, "evaluate"):
+            raise TypeError(
+                "debug=True requires a log_prob_fn with an evaluate(flat) method, "
+                "such as IMPLogPosterior."
+            )
+        initial_eval = log_prob_fn.evaluate(x0)
+        print(
+            "[RMH debug] initial "
+            f"score={initial_eval.score:.6f} "
+            f"log_prior={initial_eval.log_prior:.6f} "
+            f"log_posterior={initial_eval.log_posterior:.6f}"
+        )
 
     for i in range(n_steps):
         state, info = kernel.step(keys[i], state)
@@ -215,6 +257,30 @@ def run_rmh_on_imp_system(
         positions.append(pos_np)
         log_probs.append(lp)
         accepted.append(is_acc)
+
+        if debug and (i % debug_stride == 0):
+            evaluation = log_prob_fn.evaluate(state.position)
+            delta = float(np.linalg.norm(pos_np - previous_position))
+            discrepancy = abs(lp - evaluation.log_posterior)
+            print(
+                f"[RMH debug] step={i:5d} accepted={is_acc!s:>5} "
+                f"move_l2={delta:10.4f} score={evaluation.score:12.6f} "
+                f"log_prior={evaluation.log_prior:12.6f} "
+                f"stored_logp={lp:12.6f} recomputed_logp={evaluation.log_posterior:12.6f} "
+                f"abs_diff={discrepancy:.3e}"
+            )
+            if discrepancy > debug_tolerance:
+                print(
+                    "[RMH debug] WARNING: stored and recomputed log posterior "
+                    f"differ by more than tolerance ({debug_tolerance:.2e})."
+                )
+            if (not is_acc) and delta > debug_tolerance:
+                print(
+                    "[RMH debug] WARNING: rejected step changed the position by "
+                    f"{delta:.3e}."
+                )
+
+        previous_position = pos_np.copy()
 
         if step_callback is not None:
             step_callback(i, pos_np, lp, is_acc)

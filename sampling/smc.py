@@ -29,7 +29,7 @@ def run_tempered_smc(
     max_temperature_steps: int | None = None,
     record_best: bool = True,
     verbose: bool = True,
-) -> Tuple[Any, List, np.ndarray, np.ndarray]:
+) -> Tuple[Any, List, np.ndarray, np.ndarray, np.ndarray]:
     """
     Run BlackJAX adaptive tempered SMC with RMH mutation kernel.
     
@@ -144,6 +144,7 @@ def run_tempered_smc(
     info_history = []
     best_positions = []
     best_scores = []
+    lambdas = [float(state.tempering_param)]
     step_count = 0
     
     # Record initial state
@@ -185,6 +186,7 @@ def run_tempered_smc(
         
         info_history.append(info)
         step_count += 1
+        lambdas.append(float(state.tempering_param))
         
         # Compute movement statistics
         new_particles = np.array(state.particles)
@@ -215,8 +217,10 @@ def run_tempered_smc(
     else:
         best_positions = None
         best_scores = None
+
+    lambdas = np.asarray(lambdas, dtype=np.float64)
         
-    return state, info_history, best_positions, best_scores
+    return state, info_history, best_positions, best_scores, lambdas
 
 
 def get_smc_samples(state) -> jnp.ndarray:

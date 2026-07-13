@@ -485,7 +485,7 @@ def run_adaptive_smc_on_imp_system(
         if score_batch_size is not None:
             print("  Note: score_batch_size is ignored for adaptive SMC in this wrapper.")
 
-    state, info_history, best_positions, best_scores = run_tempered_smc(
+    state, info_history, best_positions, best_scores, lambdas = run_tempered_smc(
         log_prior_fn=adapter.log_prior,
         log_likelihood_fn=adapter.log_likelihood,
         log_prob_fn=adapter.log_prob,
@@ -505,4 +505,4 @@ def run_adaptive_smc_on_imp_system(
         best_xyz = np.stack([adapter.decode_xyz(pos) for pos in best_positions], axis=0)
         write_xyz_trajectory_rmf3(save_rmf3_path, best_xyz, verbose=verbose)
 
-    return state, info_history, best_positions, best_scores
+    return state, info_history, best_positions, best_scores, lambdas

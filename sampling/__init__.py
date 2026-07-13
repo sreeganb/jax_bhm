@@ -40,6 +40,7 @@ from .wrapper_imp_blackjax import (
     make_imp_score_function,
     run_rmh_on_imp_system,
     run_smc_on_imp_system,
+    run_adaptive_smc_on_imp_system,
 )
 
 from .smc_base_sampler import (
@@ -68,6 +69,7 @@ __all__ = [
     "build_flexible_bead_rmh_wrapper",
     "run_rmh_on_imp_system",
     "run_smc_on_imp_system",
+    "run_adaptive_smc_on_imp_system",
     "run_base_smc_rmh",
     "run_base_smc_hmc",
     "SCHEDULE_REGISTRY",

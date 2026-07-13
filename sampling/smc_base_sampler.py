@@ -174,11 +174,24 @@ def run_base_smc_rmh(
     # ----- RMH kernel ---------------------------------------------------
     rmh_kernel = blackjax.rmh.build_kernel()
 
+    # Numerical safety floor used when the model returns non-finite values.
+    bad_logp = jnp.array(-1e30, dtype=jnp.float32)
+
+    @jax.jit
+    def _safe_logp(x):
+        v = log_prob_fn(x)
+        return jnp.where(jnp.isfinite(v), v, bad_logp)
+
+    @jax.jit
+    def _safe_loglikelihood(x):
+        v = log_likelihood_fn(x)
+        return jnp.where(jnp.isfinite(v), v, bad_logp)
+
     def _rmh_proposal(rng_key, position):
         return position + jax.random.normal(rng_key, shape=position.shape) * rmh_sigma
 
     # ----- batched scoring for tracking ---------------------------------
-    score_batched = batched_vmap(log_prob_fn, batch_size=score_batch_size)
+    score_batched = batched_vmap(_safe_logp, batch_size=score_batch_size)
 
     def get_best_stats(particles):
         scores = score_batched(particles)
@@ -227,7 +240,10 @@ def run_base_smc_rmh(
 
         # --- tempered log-density at current lambda ----------------------
         def _tempered_logdensity(position, _lam=lam_curr):
-            return log_prior_fn(position) + _lam * log_likelihood_fn(position)
+            lp = log_prior_fn(position)
+            ll = _safe_loglikelihood(position)
+            val = lp + _lam * ll
+            return jnp.where(jnp.isfinite(val), val, bad_logp)
 
         # --- update_fn (batched MCMC mutations) --------------------------
         # smc_base.step passes (keys, particles, update_params).
@@ -250,8 +266,9 @@ def run_base_smc_rmh(
         # Incremental weight = (lambda_t - lambda_{t-1}) * log_likelihood(x)
         @jax.jit
         def weight_fn(particles):
-            ll = jax.vmap(log_likelihood_fn)(particles)
-            return delta_lam * ll
+            ll = jax.vmap(_safe_loglikelihood)(particles)
+            w = delta_lam * ll
+            return jnp.where(jnp.isfinite(w), w, bad_logp)
 
         # --- take one base SMC step -------------------------------------
         state, info = smc_base.step(
@@ -271,6 +288,13 @@ def run_base_smc_rmh(
             jax.block_until_ready(score)
             best_positions.append(np.array(pos))
             best_scores.append(float(score))
+
+        if verbose:
+            # Report how many particles have non-finite log posterior at this temperature.
+            finite_mask = jnp.isfinite(jax.vmap(log_prob_fn)(state.particles))
+            n_bad = int(state.particles.shape[0] - jnp.sum(finite_mask))
+            if n_bad > 0:
+                print(f"  [stability] non-finite logp particles: {n_bad}/{state.particles.shape[0]}")
 
         if verbose:
             print(

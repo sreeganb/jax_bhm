@@ -5,6 +5,8 @@ Current scope
 -------------
 - Flexible bead coordinates only.
 - Random-walk Metropolis-Hastings (RMH) using BlackJAX.
+- Basic fixed-schedule SMC for comparing convergence against RMH.
+- Adaptive tempered SMC (BlackJAX adaptive schedule).
 
 Design goal
 -----------
@@ -20,6 +22,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Protocol, Sequence, Tuple, Union
+
+import time
 
 import blackjax
 import blackjax.mcmc.random_walk as random_walk
@@ -184,6 +188,7 @@ def run_rmh_on_imp_system(
     sigma: ArrayLike = 1.0,
     initial_position: Optional[jnp.ndarray] = None,
     step_callback: Optional[Callable[[int, np.ndarray, float, bool], None]] = None,
+    save_rmf3_path: Optional[str] = None,
     verbose: bool = True,
     debug: bool = False,
     debug_stride: int = 1,
@@ -289,6 +294,15 @@ def run_rmh_on_imp_system(
     if verbose:
         print(f"Acceptance rate: {acceptance_rate:.2%}")
 
+    if save_rmf3_path is not None:
+        from io_utils.rmf3_converter import write_xyz_trajectory_rmf3
+
+        write_xyz_trajectory_rmf3(
+            save_rmf3_path,
+            np.asarray(positions).reshape(len(positions), -1, 3),
+            verbose=verbose,
+        )
+
     return RMHResult(
         positions=np.asarray(positions),
         log_probs=np.asarray(log_probs),
@@ -342,8 +356,153 @@ IMPDOFSpace = IMPParameterSpace
 IMPSMCAdapter = IMPLogPosterior
 
 
-def run_smc_on_imp_system(*args, **kwargs):
-    raise NotImplementedError(
-        "SMC was intentionally removed from this minimal wrapper. "
-        "Use run_rmh_on_imp_system(...) for flexible-bead RMH."
+def run_smc_on_imp_system(
+    adapter: Any,
+    rng_key: jax.Array,
+    n_particles: int = 500,
+    n_temperature_steps: int = 30,
+    schedule: str = "geometric",
+    kernel: str = "rmh",
+    rmh_sigma: Optional[float] = None,
+    hmc_step_size: float = 0.05,
+    hmc_num_integration_steps: int = 5,
+    n_mcmc_steps: int = 10,
+    score_batch_size: int = 32,
+    save_rmf3_path: Optional[str] = None,
+    verbose: bool = True,
+):
+    """
+    Run a stand-alone fixed-schedule SMC sampler on an IMP/JAX adapter.
+
+    This is the JIT/vmap-friendly path: the adapter provides JAX log-prior,
+    log-likelihood, and log-posterior functions, and the actual SMC loop is
+    delegated to :func:`sampling.smc_base_sampler.run_base_smc_rmh` or
+    :func:`sampling.smc_base_sampler.run_base_smc_hmc`.
+
+    The returned trajectory is the best particle at each temperature step.
+    """
+    # Import here to keep the wrapper lightweight and avoid circular imports.
+    from .smc_base_sampler import run_base_smc_hmc, run_base_smc_rmh
+
+    if verbose:
+        print(adapter.dof_summary())
+
+    # Draw an initial particle population from the adapter's prior.
+    key_init, key_smc = jax.random.split(rng_key)
+    initial_positions = adapter.sample_prior(
+        n_particles=n_particles,
+        rng_key=key_init,
+        translation_sigma=150.0,
     )
+
+    if verbose:
+        print(f"\nInitial positions shape: {initial_positions.shape}")
+        print(f"Example IMP score (particle 0): {adapter.imp_score(initial_positions[0]):.2f}")
+        print(
+            "Running fixed-schedule SMC with "
+            f"kernel={kernel}, schedule={schedule}, steps={n_temperature_steps}"
+        )
+
+    common_kwargs = dict(
+        log_prior_fn=adapter.log_prior,
+        log_likelihood_fn=adapter.log_likelihood,
+        log_prob_fn=adapter.log_prob,
+        initial_positions=initial_positions,
+        rng_key=key_smc,
+        n_temperature_steps=n_temperature_steps,
+        schedule=schedule,
+        n_mcmc_steps=n_mcmc_steps,
+        record_best=True,
+        verbose=verbose,
+        score_batch_size=score_batch_size,
+    )
+
+    if kernel == "rmh":
+        sigma = rmh_sigma if rmh_sigma is not None else adapter.suggested_rmh_sigma()
+        state, info_history, best_positions, best_scores, lambdas = run_base_smc_rmh(
+            rmh_sigma=sigma,
+            **common_kwargs,
+        )
+    elif kernel == "hmc":
+        state, info_history, best_positions, best_scores, lambdas = run_base_smc_hmc(
+            hmc_step_size=hmc_step_size,
+            hmc_num_integration_steps=hmc_num_integration_steps,
+            **common_kwargs,
+        )
+    else:
+        raise ValueError(f"Unknown kernel '{kernel}'. Choose 'rmh' or 'hmc'.")
+
+    # Save only the best configuration from each temperature step.
+    if save_rmf3_path is not None and best_positions is not None:
+        from io_utils.rmf3_converter import write_xyz_trajectory_rmf3
+
+        best_xyz = np.stack([adapter.decode_xyz(pos) for pos in best_positions], axis=0)
+        write_xyz_trajectory_rmf3(save_rmf3_path, best_xyz, verbose=verbose)
+
+    return state, info_history, best_positions, best_scores, lambdas
+
+
+def run_adaptive_smc_on_imp_system(
+    adapter: Any,
+    rng_key: jax.Array,
+    n_particles: int = 500,
+    max_temperature_steps: Optional[int] = None,
+    n_mcmc_steps: int = 10,
+    score_batch_size: Optional[int] = None,
+    rmh_sigma: Optional[float] = None,
+    target_ess: float = 0.5,
+    save_rmf3_path: Optional[str] = None,
+    verbose: bool = True,
+):
+    """
+    Run BlackJAX adaptive tempered SMC on an IMP/JAX adapter.
+
+    This uses the adaptive tempering path from :mod:`sampling.smc` and keeps
+    the same wrapper style as :func:`run_smc_on_imp_system`.
+    """
+    from .smc import run_tempered_smc
+
+    if verbose:
+        print(adapter.dof_summary())
+
+    key_init, key_smc = jax.random.split(rng_key)
+    initial_positions = adapter.sample_prior(
+        n_particles=n_particles,
+        rng_key=key_init,
+        translation_sigma=150.0,
+    )
+
+    sigma = rmh_sigma if rmh_sigma is not None else adapter.suggested_rmh_sigma()
+
+    if verbose:
+        print(f"\nInitial positions shape: {initial_positions.shape}")
+        print(f"Example IMP score (particle 0): {adapter.imp_score(initial_positions[0]):.2f}")
+        print(
+            "Running adaptive tempered SMC with "
+            f"target_ess={target_ess:.0%}, n_mcmc_steps={n_mcmc_steps}, rmh_sigma={sigma}, "
+            f"max_temperature_steps={max_temperature_steps}"
+        )
+        if score_batch_size is not None:
+            print("  Note: score_batch_size is ignored for adaptive SMC in this wrapper.")
+
+    state, info_history, best_positions, best_scores = run_tempered_smc(
+        log_prior_fn=adapter.log_prior,
+        log_likelihood_fn=adapter.log_likelihood,
+        log_prob_fn=adapter.log_prob,
+        initial_positions=initial_positions,
+        rng_key=key_smc,
+        n_mcmc_steps=n_mcmc_steps,
+        rmh_sigma=sigma,
+        target_ess=target_ess,
+        max_temperature_steps=max_temperature_steps,
+        record_best=True,
+        verbose=verbose,
+    )
+
+    if save_rmf3_path is not None and best_positions is not None:
+        from io_utils.rmf3_converter import write_xyz_trajectory_rmf3
+
+        best_xyz = np.stack([adapter.decode_xyz(pos) for pos in best_positions], axis=0)
+        write_xyz_trajectory_rmf3(save_rmf3_path, best_xyz, verbose=verbose)
+
+    return state, info_history, best_positions, best_scores

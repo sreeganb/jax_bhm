@@ -26,6 +26,7 @@ def run_tempered_smc(
     n_mcmc_steps: int = 10,
     rmh_sigma: float = 1.0,
     target_ess: float = 0.5,
+    max_temperature_steps: int | None = None,
     record_best: bool = True,
     verbose: bool = True,
 ) -> Tuple[Any, List, np.ndarray, np.ndarray]:
@@ -155,6 +156,13 @@ def run_tempered_smc(
 
     # Main SMC loop - run until lambda = 1
     while state.tempering_param < 1.0:
+        if max_temperature_steps is not None and step_count >= int(max_temperature_steps):
+            if verbose:
+                print(
+                    f"Reached max_temperature_steps={int(max_temperature_steps)} before λ=1.0; "
+                    f"stopping at λ={float(state.tempering_param):.4f}"
+                )
+            break
         # Split random key
         rng_key, step_key = jax.random.split(rng_key)
         

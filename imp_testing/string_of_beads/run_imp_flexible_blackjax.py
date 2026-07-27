@@ -457,7 +457,7 @@ def run_rmh_case(
         log_prob_fn=rmh_adapter.log_prob,
         initial_position=x0,
         rng_key=jax.random.PRNGKey(0),
-        n_steps=1000,
+        n_steps=10000,
         sigma=2.0,
         proposal_fn=proposal_fn,
         sync_fn=sync_fn,
@@ -687,7 +687,7 @@ def main():
     box_half_width = 300.0
 
     # Sampling mode: choose from {'flex', 'rigid', 'all'}.
-    smc_dof_mode = "flex"
+    smc_dof_mode = "all"
     smc_debug = True
     smc_debug_stride = 10
 

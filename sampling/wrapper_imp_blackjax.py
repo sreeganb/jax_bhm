@@ -181,12 +181,14 @@ def create_rmh_kernel(log_prob_fn: Callable[[jnp.ndarray], jnp.ndarray], sigma: 
 
 
 def run_rmh_on_imp_system(
-    parameter_space: IMPParameterSpace,
     log_prob_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    initial_position: jnp.ndarray,
     rng_key: jax.Array,
     n_steps: int = 1000,
     sigma: ArrayLike = 1.0,
-    initial_position: Optional[jnp.ndarray] = None,
+    proposal_fn: Optional[Callable[[jax.Array, jnp.ndarray], jnp.ndarray]] = None,
+    sync_fn: Optional[Callable[[np.ndarray], None]] = None,
+    sync_stride: int = 10,
     step_callback: Optional[Callable[[int, np.ndarray, float, bool], None]] = None,
     save_rmf3_path: Optional[str] = None,
     verbose: bool = True,
@@ -195,118 +197,108 @@ def run_rmh_on_imp_system(
     debug_tolerance: float = 1e-5,
 ) -> RMHResult:
     """
-    Run step-by-step RMH and keep IMP in sync with accepted states.
+    Run RMH over a flat position vector using a pure log-probability callable.
+
+    Sampling is fully JAX-native (``lax.scan``). IMP writes are optional and
+    happen only through ``sync_fn`` after the chain has been generated.
 
     Parameters
     ----------
-    parameter_space:
-        Knows how to unpack sampled vectors into IMP.
     log_prob_fn:
-        Callable over flat vectors, usually IMPLogPosterior(...).
+        Pure callable over flat vectors.
+    initial_position:
+        Starting point in flat coordinates.
     rng_key:
         JAX RNG key.
     n_steps:
         Number of RMH iterations.
     sigma:
         Proposal width (scalar or per-dimension vector).
-    initial_position:
-        Starting point. If None, reads current IMP coordinates.
+    proposal_fn:
+        Optional proposal function for BlackJAX RMH kernel. If omitted, uses
+        isotropic/per-dimension Gaussian random walk controlled by ``sigma``.
+    sync_fn:
+        Optional callback ``sync_fn(flat_position)`` used to write sampled
+        positions into IMP for trajectory/final output.
+    sync_stride:
+        Call ``sync_fn`` every this many steps (and always on the final step).
     step_callback:
         Optional callback(step, position, log_prob, is_accepted).
     debug:
-        If True, periodically recompute the IMP-backed log posterior from the
-        current state and print detailed consistency diagnostics.
+        Retained for backward compatibility. This function now assumes a pure
+        ``log_prob_fn`` and does not perform IMP-backed recomputation checks.
     debug_stride:
         Print debug output every this many steps when debug=True.
     debug_tolerance:
         Warn if stored BlackJAX logdensity and fresh recomputation differ by
         more than this amount.
     """
-    kernel = create_rmh_kernel(log_prob_fn, sigma)
-    x0 = parameter_space.pack() if initial_position is None else jnp.asarray(initial_position)
-    state = kernel.init(x0)
+    if n_steps <= 0:
+        raise ValueError("n_steps must be positive.")
+    if sync_stride <= 0:
+        raise ValueError("sync_stride must be positive.")
 
-    keys = jax.random.split(rng_key, n_steps)
-    positions: List[np.ndarray] = []
-    log_probs: List[float] = []
-    accepted: List[bool] = []
+    x0 = jnp.asarray(initial_position).reshape(-1)
+
+    if proposal_fn is None:
+        kernel = create_rmh_kernel(log_prob_fn, sigma)
+        state = kernel.init(x0)
+
+        def _step_fn(carry, key):
+            new_state, info = kernel.step(key, carry)
+            return new_state, (new_state.position, new_state.logdensity, info.is_accepted)
+    else:
+        base_kernel = blackjax.rmh.build_kernel()
+        state = blackjax.rmh.init(x0, log_prob_fn)
+
+        def _step_fn(carry, key):
+            new_state, info = base_kernel(key, carry, log_prob_fn, proposal_fn)
+            return new_state, (new_state.position, new_state.logdensity, info.is_accepted)
 
     if verbose:
-        print(f"Running RMH for {n_steps} steps in {parameter_space.dim} dimensions.")
-
-    previous_position = np.asarray(x0)
-    if debug:
-        if not hasattr(log_prob_fn, "evaluate"):
-            raise TypeError(
-                "debug=True requires a log_prob_fn with an evaluate(flat) method, "
-                "such as IMPLogPosterior."
-            )
-        initial_eval = log_prob_fn.evaluate(x0)
-        print(
-            "[RMH debug] initial "
-            f"score={initial_eval.score:.6f} "
-            f"log_prior={initial_eval.log_prior:.6f} "
-            f"log_posterior={initial_eval.log_posterior:.6f}"
-        )
-
-    for i in range(n_steps):
-        state, info = kernel.step(keys[i], state)
-
-        # Keep IMP model aligned with the chain state after accept/reject.
-        parameter_space.unpack(state.position)
-
-        pos_np = np.asarray(state.position)
-        lp = float(state.logdensity)
-        is_acc = bool(info.is_accepted)
-
-        positions.append(pos_np)
-        log_probs.append(lp)
-        accepted.append(is_acc)
-
-        if debug and (i % debug_stride == 0):
-            evaluation = log_prob_fn.evaluate(state.position)
-            delta = float(np.linalg.norm(pos_np - previous_position))
-            discrepancy = abs(lp - evaluation.log_posterior)
+        print(f"Running RMH for {n_steps} steps in {x0.shape[0]} dimensions.")
+        if debug:
             print(
-                f"[RMH debug] step={i:5d} accepted={is_acc!s:>5} "
-                f"move_l2={delta:10.4f} score={evaluation.score:12.6f} "
-                f"log_prior={evaluation.log_prior:12.6f} "
-                f"stored_logp={lp:12.6f} recomputed_logp={evaluation.log_posterior:12.6f} "
-                f"abs_diff={discrepancy:.3e}"
+                "[RMH debug] IMP-backed debug recomputation is disabled in the "
+                "decoupled RMH path."
             )
-            if discrepancy > debug_tolerance:
-                print(
-                    "[RMH debug] WARNING: stored and recomputed log posterior "
-                    f"differ by more than tolerance ({debug_tolerance:.2e})."
-                )
-            if (not is_acc) and delta > debug_tolerance:
-                print(
-                    "[RMH debug] WARNING: rejected step changed the position by "
-                    f"{delta:.3e}."
-                )
 
-        previous_position = pos_np.copy()
+    keys = jax.random.split(rng_key, n_steps)
+    final_state, (positions_jax, log_probs_jax, accepted_jax) = jax.lax.scan(
+        _step_fn, state, keys
+    )
 
-        if step_callback is not None:
-            step_callback(i, pos_np, lp, is_acc)
+    _ = final_state
+    positions = np.asarray(jax.device_get(positions_jax))
+    log_probs = np.asarray(jax.device_get(log_probs_jax))
+    accepted = np.asarray(jax.device_get(accepted_jax), dtype=bool)
 
-    acceptance_rate = float(np.mean(np.asarray(accepted, dtype=np.float64)))
+    if sync_fn is not None or step_callback is not None:
+        for i in range(n_steps):
+            pos_np = np.asarray(positions[i])
+            lp = float(log_probs[i])
+            is_acc = bool(accepted[i])
+
+            if sync_fn is not None and ((i % sync_stride == 0) or (i == n_steps - 1)):
+                sync_fn(pos_np)
+
+            if step_callback is not None:
+                step_callback(i, pos_np, lp, is_acc)
+
+    acceptance_rate = float(np.mean(accepted.astype(np.float64)))
     if verbose:
         print(f"Acceptance rate: {acceptance_rate:.2%}")
 
     if save_rmf3_path is not None:
-        from io_utils.rmf3_converter import write_xyz_trajectory_rmf3
-
-        write_xyz_trajectory_rmf3(
-            save_rmf3_path,
-            np.asarray(positions).reshape(len(positions), -1, 3),
-            verbose=verbose,
+        raise ValueError(
+            "save_rmf3_path is not supported in the decoupled RMH API. "
+            "Use sync_fn + step_callback for RMF output."
         )
 
     return RMHResult(
-        positions=np.asarray(positions),
-        log_probs=np.asarray(log_probs),
-        accepted=np.asarray(accepted),
+        positions=positions,
+        log_probs=log_probs,
+        accepted=accepted,
         acceptance_rate=acceptance_rate,
     )
 
@@ -427,12 +419,8 @@ def run_smc_on_imp_system(
 
         proposal_fn = rmh_proposal_fn
         if proposal_fn is None and hasattr(adapter, "make_rmh_proposal_fn"):
-            try:
-                proposal_cfg = adapter.suggested_rmh_proposal() if hasattr(adapter, "suggested_rmh_proposal") else {}
-                proposal_fn = adapter.make_rmh_proposal_fn(**proposal_cfg)
-            except Exception:
-                # Keep the wrapper backward-compatible: fall back to isotropic RMH.
-                proposal_fn = None
+            proposal_cfg = adapter.suggested_rmh_proposal() if hasattr(adapter, "suggested_rmh_proposal") else {}
+            proposal_fn = adapter.make_rmh_proposal_fn(**proposal_cfg)
 
         state, info_history, best_positions, best_scores, lambdas = run_base_smc_rmh(
             rmh_sigma=sigma,
@@ -495,12 +483,8 @@ def run_adaptive_smc_on_imp_system(
 
     proposal_fn = rmh_proposal_fn
     if proposal_fn is None and hasattr(adapter, "make_rmh_proposal_fn"):
-        try:
-            proposal_cfg = adapter.suggested_rmh_proposal() if hasattr(adapter, "suggested_rmh_proposal") else {}
-            proposal_fn = adapter.make_rmh_proposal_fn(**proposal_cfg)
-        except Exception:
-            # Keep the wrapper backward-compatible: fall back to isotropic RMH.
-            proposal_fn = None
+        proposal_cfg = adapter.suggested_rmh_proposal() if hasattr(adapter, "suggested_rmh_proposal") else {}
+        proposal_fn = adapter.make_rmh_proposal_fn(**proposal_cfg)
 
     if verbose:
         print(f"\nInitial positions shape: {initial_positions.shape}")

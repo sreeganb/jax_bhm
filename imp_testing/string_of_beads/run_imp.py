@@ -179,14 +179,14 @@ print("from PMI tools, the rbs and beads: ", rbs, beads)
 
 # Following along the code used inside of the _jax_rigid function inside of 
 # IMP/core
-_FB_LIST_KEY = IMP.ModelKey("flexible bead list")
-def get_flexible_bead_indices(model):
-    assert model.get_has_data(_FB_LIST_KEY), "Model does not have flexible bead list"
-    fbl = model.get_data(_FB_LIST_KEY)
-    fbl = IMP.SingletonContainer(fbl)
-    return fbl.get_contents()
-get_flexible_bead_indices(m)
-
+#_FB_LIST_KEY = IMP.ModelKey("flexible bead list")
+#def get_flexible_bead_indices(model):
+#    assert model.get_has_data(_FB_LIST_KEY), "Model does not have flexible bead list"
+#    fbl = model.get_data(_FB_LIST_KEY)
+#    fbl = IMP.SingletonContainer(fbl)
+#    return fbl.get_contents()
+#get_flexible_bead_indices(m)
+#
 #----------------------------------------------------------------------------
 """
 Some outputs from native IMP, before converting to JAX.

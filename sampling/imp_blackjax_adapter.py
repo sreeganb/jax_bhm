@@ -70,8 +70,10 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import IMP
+import IMP.algebra
 import IMP.atom
 import IMP.core
+from IMP.core._jax_rigid import _get_rigid_bodies
 import IMP.pmi.dof
 import jax
 import jax.numpy as jnp
@@ -349,64 +351,86 @@ def _build_particle_index_map_by_coordinates(
     return pid_to_jax
 
 
-def _extract_rb_info(dof: IMP.pmi.dof.DegreesOfFreedom,
-                     base_xyz: np.ndarray,
-                     particle_index_map: Dict[int, int],
-                     ) -> Tuple[List, np.ndarray]:
+def _extract_rb_info(model: IMP.Model, base_xyz: np.ndarray) -> Tuple[List[dict], set, int]:
     """
-    Walk the rigid bodies in `dof` and return:
-      - A list of RB descriptors, each being a dict with keys:
-          dof_offset  : int  – first index in the flat DOF vector for this RB
-          n_dof       : int  – always 7 (3 translation + 4 quaternion)
-          com         : np.ndarray shape (3,) – initial centre of mass
-          quat_init   : np.ndarray shape (4,) – initial quaternion [w,x,y,z]
-          member_jax_indices : list[int] – indices into jax xyz array
-          member_local_xyz   : np.ndarray shape (M,3) – positions relative to COM
-      - The residual xyz for non-RB particles (flexible beads etc.), shape (K, 3).
+    Extract rigid-body descriptors from IMP's JAX rigid-body representation.
+
+    This path mirrors IMP's own conventions via ``_get_rigid_bodies`` and
+    therefore preserves exact round-trips on rigid-body rows.
     """
-    rb_descriptors = []
+    jr = _get_rigid_bodies(model)
+
+    if len(jr.non_rigid_members) > 0:
+        raise NotImplementedError(
+            "IMP JAX non-rigid members are not supported yet. "
+            "They require a body-frame 3-DOF parameter block."
+        )
+
+    intcoord = np.asarray(jr.intcoord, dtype=np.float64)
+    quats = np.asarray(jr.quaternion, dtype=np.float64)
+
+    rb_descriptors: List[dict] = []
+    handled_rows: set = set()
     dof_offset = 0
 
-    handled_particle_ids: set = set()
+    for body in jr.bodies:
+        if len(body.body_member_indexes) > 0:
+            raise NotImplementedError("Nested rigid bodies are not supported.")
 
-    rb_movers = [m for m in dof.get_movers()
-                 if isinstance(m, IMP.core.RigidBodyMover)]
+        member_rows = np.asarray(body.member_particle_indexes, dtype=np.int64)
+        rb_row = int(body.particle_index)
+        rb_idx = int(body.rb_index)
 
-    for mover in rb_movers:
-        rb = _get_rb_from_mover(mover)
-        members = _get_rb_member_particles(rb)
+        rb_descriptors.append(
+            {
+                "dof_offset": dof_offset,
+                "n_dof": 7,
+                "rb_row": rb_row,
+                "com_init": np.asarray(base_xyz[rb_row], dtype=np.float64).copy(),
+                "quat_init": np.asarray(quats[rb_idx], dtype=np.float64).copy(),
+                "member_rows": member_rows,
+                "member_local_xyz": np.asarray(intcoord[member_rows], dtype=np.float64).copy(),
+            }
+        )
 
-        member_jax_idxs = []
-        member_local = []
-        com = np.array(rb.get_coordinates())
-
-        for leaf in members:
-            pid = leaf.get_index()
-            if pid in particle_index_map:
-                jax_idx = particle_index_map[pid]
-                member_jax_idxs.append(jax_idx)
-                handled_particle_ids.add(jax_idx)
-                local = base_xyz[jax_idx] - com
-                member_local.append(local)
-
-        if not member_jax_idxs:
-            continue
-
-        rot = rb.get_reference_frame().get_transformation_to().get_rotation()
-        qv = rot.get_quaternion()
-        quat_init = np.array([qv[0], qv[1], qv[2], qv[3]])
-
-        rb_descriptors.append({
-            "dof_offset": dof_offset,
-            "n_dof": 7,
-            "com_init": com.copy(),
-            "quat_init": quat_init.copy(),
-            "member_jax_indices": member_jax_idxs,
-            "member_local_xyz": np.array(member_local),
-        })
+        handled_rows.add(rb_row)
+        handled_rows.update(int(v) for v in member_rows.tolist())
         dof_offset += 7
 
-    return rb_descriptors, handled_particle_ids, dof_offset
+    return rb_descriptors, handled_rows, dof_offset
+
+
+def _get_model_from_dof(dof: IMP.pmi.dof.DegreesOfFreedom) -> IMP.Model:
+    """Resolve IMP model from a DOF object across API variants."""
+    getter = getattr(dof, "get_model", None)
+    if callable(getter):
+        return getter()
+
+    movers = list(dof.get_movers())
+    if not movers:
+        raise RuntimeError("Cannot resolve IMP model from empty DOF movers.")
+    return movers[0].get_model()
+
+
+def _get_model_particle_count(model: IMP.Model) -> int:
+    """Return number of model particles across IMP API variants."""
+    getter = getattr(model, "get_number_of_particles", None)
+    if callable(getter):
+        return int(getter())
+
+    index_getter = getattr(model, "get_particle_indexes", None)
+    if callable(index_getter):
+        return int(len(list(index_getter())))
+
+    index_getter = getattr(model, "get_particle_indices", None)
+    if callable(index_getter):
+        return int(len(list(index_getter())))
+
+    raise AttributeError(
+        "Could not determine IMP model particle count: expected one of "
+        "get_number_of_particles(), get_particle_indexes(), or "
+        "get_particle_indices()."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +448,7 @@ class IMPDOFSpace:
         Total dimension of the flat position vector seen by BlackJAX.
     rb_descriptors : list
         One dict per rigid body (see _extract_rb_info).
-    fb_jax_indices : list[int]
+    fb_rows : list[int]
         JAX xyz-array indices of flexible-bead particles.
     fb_dof_offset : int
         Where flexible-bead coords start in the flat DOF vector.
@@ -433,9 +457,14 @@ class IMPDOFSpace:
     """
     n_dof: int
     rb_descriptors: List[dict]
-    fb_jax_indices: List[int]
+    fb_rows: List[int]
     fb_dof_offset: int
     base_jm: dict
+
+    @property
+    def fb_jax_indices(self) -> List[int]:
+        """Backward-compatible alias for flexible row indices."""
+        return self.fb_rows
 
     @staticmethod
     def from_imp(dof: IMP.pmi.dof.DegreesOfFreedom,
@@ -460,46 +489,40 @@ class IMPDOFSpace:
                 f"Invalid mode={mode!r}; expected one of 'all', 'flex', 'rigid'."
             )
 
-        base_xyz = np.array(jm_initial["xyz"])  # (N, 3)
-
-        # Build particle-id -> jax-index map with IMP API compatibility.
-        imp_particle_indices = _extract_particle_indices_from_ji(ji, jm_initial)
-        if imp_particle_indices is not None:
-            pid_to_jax = {
-                int(pid): int(jax_idx)
-                for jax_idx, pid in enumerate(imp_particle_indices)
-            }
-        else:
-            pid_to_jax = _build_particle_index_map_by_coordinates(dof, base_xyz)
+        base_xyz = np.asarray(jm_initial["xyz"], dtype=np.float64)  # (N, 3)
+        model = _get_model_from_dof(dof)
+        n_model_particles = _get_model_particle_count(model)
+        if int(base_xyz.shape[0]) != n_model_particles:
+            raise AssertionError(
+                "xyz table is not particle-indexed; identity mapping assumption broken"
+            )
 
         if mode in {"all", "rigid"}:
             rb_descriptors, handled, dof_offset = _extract_rb_info(
-                dof, base_xyz, pid_to_jax
+                model, base_xyz
             )
         else:
             # Flexible-only mode: no rigid-body parameter blocks.
             rb_descriptors, handled, dof_offset = [], set(), 0
 
         # Flexible bead movers
-        fb_jax_indices = []
+        fb_rows = []
         if mode in {"all", "flex"}:
             fb_movers = [m for m in dof.get_movers()
                          if isinstance(m, IMP.core.BallMover)]
             for mover in fb_movers:
                 for p in _get_ball_mover_particles(mover):
-                    pid = p.get_index()
-                    if pid in pid_to_jax:
-                        jax_idx = pid_to_jax[pid]
-                        if jax_idx not in handled:
-                            fb_jax_indices.append(jax_idx)
+                    row = int(p.get_index())
+                    if row not in handled:
+                        fb_rows.append(row)
 
-        n_fb = len(fb_jax_indices)
+        n_fb = len(fb_rows)
         n_dof = dof_offset + 3 * n_fb
 
         return IMPDOFSpace(
             n_dof=n_dof,
             rb_descriptors=rb_descriptors,
-            fb_jax_indices=fb_jax_indices,
+            fb_rows=fb_rows,
             fb_dof_offset=dof_offset,
             base_jm=jm_initial,
         )
@@ -510,17 +533,84 @@ class IMPDOFSpace:
         DOF vector (numpy, shape (n_dof,)).
         """
         vec = np.zeros(self.n_dof, dtype=np.float32)
+        base_xyz = np.asarray(self.base_jm["xyz"], dtype=np.float64)
+
         for rb in self.rb_descriptors:
             o = rb["dof_offset"]
-            vec[o:o+3] = rb["com_init"]
+            rb_row = int(rb["rb_row"])
+            vec[o:o+3] = base_xyz[rb_row]
             vec[o+3:o+7] = rb["quat_init"]
 
-        base_xyz = np.array(self.base_jm["xyz"])
-        for i, jax_idx in enumerate(self.fb_jax_indices):
+        for i, row in enumerate(self.fb_rows):
             o = self.fb_dof_offset + 3 * i
-            vec[o:o+3] = base_xyz[jax_idx]
+            vec[o:o+3] = base_xyz[int(row)]
 
         return vec
+
+
+def write_flat_to_imp(model: IMP.Model, dof_space: IMPDOFSpace, flat: np.ndarray) -> None:
+    """
+    Write a flat state into IMP.
+
+    Rigid bodies are written via reference frames. Flexible rows are written
+    directly as XYZ coordinates.
+    """
+    flat = np.asarray(flat, dtype=np.float64).reshape(-1)
+    if flat.shape[0] != int(dof_space.n_dof):
+        raise ValueError(
+            f"Expected flat vector of size {dof_space.n_dof}, got {flat.shape[0]}."
+        )
+
+    for desc in dof_space.rb_descriptors:
+        o = int(desc["dof_offset"])
+        rb_row = int(desc["rb_row"])
+        t = flat[o : o + 3]
+        q = flat[o + 3 : o + 7]
+        q_norm = np.linalg.norm(q)
+        if q_norm <= 0.0:
+            raise ValueError("Encountered zero-norm quaternion in write_flat_to_imp.")
+        q = q / q_norm
+
+        tr = IMP.algebra.Transformation3D(
+            IMP.algebra.Rotation3D(*q.tolist()),
+            IMP.algebra.Vector3D(*t.tolist()),
+        )
+        IMP.core.RigidBody(model, IMP.ParticleIndex(rb_row)).set_reference_frame(
+            IMP.algebra.ReferenceFrame3D(tr)
+        )
+
+    for i, row in enumerate(dof_space.fb_rows):
+        o = int(dof_space.fb_dof_offset) + 3 * i
+        IMP.core.XYZ(model, IMP.ParticleIndex(int(row))).set_coordinates(
+            IMP.algebra.Vector3D(*flat[o : o + 3].tolist())
+        )
+
+    model.update()
+
+
+def assert_imp_roundtrip(
+    model: IMP.Model,
+    ji,
+    adapter: "IMPSMCAdapter",
+    flat: Optional[np.ndarray] = None,
+    atol: float = 1e-8,
+) -> float:
+    """Assert IMP and adapter xyz expansions match after writing a flat state."""
+    state = np.asarray(adapter.encode() if flat is None else flat, dtype=np.float64)
+    write_flat_to_imp(model, adapter.dof_space, state)
+
+    imp_xyz = np.asarray(ji.get_jax_model()["xyz"], dtype=np.float64)
+    jax_xyz = np.asarray(adapter.decode_xyz(jnp.asarray(state)), dtype=np.float64)
+    finite = np.isfinite(imp_xyz).all(axis=1)
+
+    if not np.allclose(imp_xyz[finite], jax_xyz[finite], atol=atol):
+        max_abs_err = float(np.max(np.abs(imp_xyz[finite] - jax_xyz[finite])))
+        raise AssertionError(
+            "IMP/JAX rigid-body roundtrip mismatch: "
+            f"max_abs_err={max_abs_err:.3e}, atol={atol:.1e}"
+        )
+
+    return float(np.max(np.abs(imp_xyz[finite] - jax_xyz[finite])))
 
 
 # ---------------------------------------------------------------------------
@@ -574,8 +664,11 @@ class IMPSMCAdapter:
         self._rb_offsets = tuple(
             int(rb["dof_offset"]) for rb in dof_space.rb_descriptors
         )
-        self._rb_member_indices = [
-            jnp.array(rb["member_jax_indices"], dtype=jnp.int32)
+        self._rb_rows = tuple(
+            int(rb["rb_row"]) for rb in dof_space.rb_descriptors
+        )
+        self._rb_member_rows = [
+            jnp.array(rb["member_rows"], dtype=jnp.int32)
             for rb in dof_space.rb_descriptors
         ]
         self._rb_local_xyz = [
@@ -584,7 +677,7 @@ class IMPSMCAdapter:
         ]
 
         # Flexible bead indices
-        self._fb_indices = jnp.array(dof_space.fb_jax_indices, dtype=jnp.int32)
+        self._fb_indices = jnp.array(dof_space.fb_rows, dtype=jnp.int32)
         self._fb_dof_offset = int(dof_space.fb_dof_offset)
 
         self._jax_score_func = jax_score_func
@@ -598,7 +691,8 @@ class IMPSMCAdapter:
         base_xyz = self._base_xyz
         base_jm = self._base_jm_jax
         rb_offsets = self._rb_offsets
-        rb_member_indices = self._rb_member_indices
+        rb_rows = self._rb_rows
+        rb_member_rows = self._rb_member_rows
         rb_local_xyz = self._rb_local_xyz
         fb_indices = self._fb_indices
         fb_dof_offset = self._fb_dof_offset
@@ -611,17 +705,17 @@ class IMPSMCAdapter:
             xyz = base_xyz  # start from template
 
             # --- rigid bodies ---
-            for i, (rb_idxs, local) in enumerate(
-                zip(rb_member_indices, rb_local_xyz)
+            for i, (member_rows, local) in enumerate(
+                zip(rb_member_rows, rb_local_xyz)
             ):
                 o = rb_offsets[i]
                 translation = flat[o : o + 3]          # (3,)
                 raw_quat    = flat[o + 3 : o + 7]      # (4,)
                 quat        = _normalise_quat(raw_quat)
                 R           = _quat_to_rotation_matrix(quat)   # (3,3)
-                rotated     = (R @ local.T).T           # (M, 3)
-                world_xyz   = rotated + translation[None, :]    # (M, 3)
-                xyz = xyz.at[rb_idxs].set(world_xyz)
+                world_xyz   = local @ R.T + translation[None, :]
+                xyz = xyz.at[member_rows].set(world_xyz)
+                xyz = xyz.at[rb_rows[i]].set(translation)
 
             # --- flexible beads ---
             if fb_indices.shape[0] > 0:
@@ -825,7 +919,7 @@ class IMPSMCAdapter:
             f"  Total DOF    : {self.dof_space.n_dof}",
             f"  Rigid bodies : {len(self.dof_space.rb_descriptors)} "
             f"(each 7 DOF: 3 translation + 4 quaternion)",
-            f"  Flexible bead particles: {len(self.dof_space.fb_jax_indices)} "
+            f"  Flexible bead particles: {len(self.dof_space.fb_rows)} "
             f"(each 3 DOF)",
             f"  kT           : {self.kT}",
             f"  Box half-width: {self.box_half_width} Å",

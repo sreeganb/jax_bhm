@@ -25,12 +25,16 @@ import jax
 import jax.numpy as jnp
 
 from sampling.wrapper_imp_blackjax import (
-    build_flexible_bead_rmh_wrapper,
     run_rmh_on_imp_system,
     run_smc_on_imp_system,
     run_adaptive_smc_on_imp_system,
 )
-from sampling.imp_blackjax_adapter import IMPDOFSpace, IMPSMCAdapter
+from sampling.imp_blackjax_adapter import (
+    IMPDOFSpace,
+    IMPSMCAdapter,
+    assert_imp_roundtrip,
+    write_flat_to_imp,
+)
 
 
 class TeeStream:
@@ -348,6 +352,15 @@ def write_best_positions_to_rmf(root_hier, smc_adapter, best_positions, rmf_path
         )
 
 
+def make_imp_sync_fn(model, smc_adapter):
+    """Build a callback that writes a flat sampled state into IMP coordinates."""
+
+    def _sync(flat_position):
+        write_flat_to_imp(model, smc_adapter.dof_space, flat_position)
+
+    return _sync
+
+
 def build_smc_adapter_context(root_hier, dof, sf_imp, box_half_width, dof_mode="flex"):
     """Build SMC adapter plus hierarchy-to-JAX row mapping."""
     ji = sf_imp._get_jax()
@@ -388,8 +401,52 @@ def build_smc_adapter_context(root_hier, dof, sf_imp, box_half_width, dof_mode="
     return smc_adapter, leaf_rows, n_jax_rows
 
 
-def run_rmh_case(parameter_space, log_posterior, sf_imp, root_hier, rmh_trajectory_rmf, rmh_final_rmf):
+def run_rmh_case(
+    model,
+    root_hier,
+    dof,
+    sf_imp,
+    box_half_width,
+    dof_mode,
+    rmh_trajectory_rmf,
+    rmh_final_rmf,
+):
     """Run RMH sampling and write trajectory/final snapshots."""
+    rmh_adapter, leaf_rows, n_jax_rows = build_smc_adapter_context(
+        root_hier=root_hier,
+        dof=dof,
+        sf_imp=sf_imp,
+        box_half_width=box_half_width,
+        dof_mode=dof_mode,
+    )
+
+    proposal_fn = None
+    if hasattr(rmh_adapter, "make_rmh_proposal_fn"):
+        proposal_cfg = (
+            rmh_adapter.suggested_rmh_proposal()
+            if hasattr(rmh_adapter, "suggested_rmh_proposal")
+            else {}
+        )
+        proposal_fn = rmh_adapter.make_rmh_proposal_fn(**proposal_cfg)
+
+    x0 = rmh_adapter.encode()
+    ji = sf_imp._get_jax()
+    roundtrip_err = assert_imp_roundtrip(model, ji, rmh_adapter, flat=np.asarray(x0))
+    print(f"IMP/JAX roundtrip check passed (max_abs_err={roundtrip_err:.3e}).")
+
+    initial_log_prob = float(rmh_adapter.log_prob(x0))
+    initial_log_prior = float(rmh_adapter.log_prior(x0))
+    initial_score = rmh_adapter.imp_score(x0)
+    print(
+        "Initial RMH posterior components: "
+        f"score={initial_score:.6f}, "
+        f"log_prior={initial_log_prior:.6f}, "
+        f"log_posterior={initial_log_prob:.6f}"
+    )
+    print(f"Sampling dimension: {x0.shape[0]}")
+
+    sync_fn = make_imp_sync_fn(model=model, smc_adapter=rmh_adapter)
+
     rmf_output, step_callback = make_rmf_step_callback(
         root_hier,
         rmf_path=str(rmh_trajectory_rmf),
@@ -397,30 +454,35 @@ def run_rmh_case(parameter_space, log_posterior, sf_imp, root_hier, rmh_trajecto
     )
 
     result = run_rmh_on_imp_system(
-        parameter_space=parameter_space,
-        log_prob_fn=log_posterior,
+        log_prob_fn=rmh_adapter.log_prob,
+        initial_position=x0,
         rng_key=jax.random.PRNGKey(0),
         n_steps=1000,
         sigma=2.0,
+        proposal_fn=proposal_fn,
+        sync_fn=sync_fn,
+        sync_stride=10,
         step_callback=step_callback,
         verbose=True,
-        debug=True,
-        debug_stride=50,
     )
 
     rmf_output.close_rmf(str(rmh_trajectory_rmf))
 
+    # Ensure final frame reflects the terminal chain state.
+    sync_fn(result.positions[-1])
+
     final_score = sf_imp.evaluate(False)
-    final_eval = log_posterior.evaluate(parameter_space.pack())
+    final_log_prior = float(rmh_adapter.log_prior(result.positions[-1]))
+    final_log_prob = float(rmh_adapter.log_prob(result.positions[-1]))
     print("\nRMH completed.")
     print(f"  Acceptance rate: {result.acceptance_rate:.2%}")
     print(f"  Best log posterior: {np.max(result.log_probs):.6f}")
     print(f"  Final IMP score: {final_score:.6f}")
     print(
         "  Final posterior components: "
-        f"score={final_eval.score:.6f}, "
-        f"log_prior={final_eval.log_prior:.6f}, "
-        f"log_posterior={final_eval.log_posterior:.6f}"
+        f"score={final_score:.6f}, "
+        f"log_prior={final_log_prior:.6f}, "
+        f"log_posterior={final_log_prob:.6f}"
     )
 
     out = IMP.pmi.output.Output()
@@ -604,7 +666,7 @@ def run_replica_exchange_case(m, root_hier, dof, sf_imp, rex_final_rmf):
 
 
 def main():
-    m, root_hier, dof, sf_imp, flexible_particle_indices = build_imp_system()
+    m, root_hier, dof, sf_imp, _ = build_imp_system()
 
     rmh_output_dir = prepare_sampler_output_dir("rmh")
     smc_output_dir = prepare_sampler_output_dir("smc")
@@ -621,43 +683,22 @@ def main():
     adaptive_smc_final_rmf = adaptive_smc_output_dir / "adaptive_smc_flexible_final.rmf3"
     rex_final_rmf = rex_output_dir / "replica_exchange_flexible_final.rmf3"
 
-    # Optional weak box prior to avoid unconstrained drift.
+    # Optional weak box width for adapter prior.
     box_half_width = 300.0
-    box_sigma = 20.0
 
-    # SMC sampling mode: choose from {'flex', 'rigid', 'all'}.
+    # Sampling mode: choose from {'flex', 'rigid', 'all'}.
     smc_dof_mode = "flex"
     smc_debug = True
     smc_debug_stride = 10
 
-    def log_prior_fn(flat):
-        excess = jnp.maximum(jnp.abs(flat) - box_half_width, 0.0)
-        return -0.5 * jnp.sum((excess / box_sigma) ** 2)
-
-    parameter_space, log_posterior = build_flexible_bead_rmh_wrapper(
-        model=m,
-        scoring_function=sf_imp,
-        flexible_particle_indices=flexible_particle_indices,
-        temperature=1.0,
-        log_prior_fn=log_prior_fn,
-    )
-
-    initial_eval = log_posterior.evaluate(parameter_space.pack())
-    print(
-        "Initial posterior components: "
-        f"score={initial_eval.score:.6f}, "
-        f"log_prior={initial_eval.log_prior:.6f}, "
-        f"log_posterior={initial_eval.log_posterior:.6f}"
-    )
-
-    print(f"Sampling dimension: {parameter_space.dim}")
-
     with tee_to_log(rmh_output_dir / "rmh_run.log"):
         run_rmh_case(
-            parameter_space=parameter_space,
-            log_posterior=log_posterior,
-            sf_imp=sf_imp,
+            model=m,
             root_hier=root_hier,
+            dof=dof,
+            sf_imp=sf_imp,
+            box_half_width=box_half_width,
+            dof_mode=smc_dof_mode,
             rmh_trajectory_rmf=rmh_trajectory_rmf,
             rmh_final_rmf=rmh_final_rmf,
         )

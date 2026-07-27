@@ -17,6 +17,46 @@ from typing import Callable, Tuple, List, Any
 import time
 
 
+def _safe_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _extract_tempered_info_fields(info) -> dict:
+    fields = {
+        "ess": None,
+        "log_normalizer_increment": None,
+        "mean_acceptance_rate": None,
+    }
+
+    for key in ("ess", "effective_sample_size", "log_normalizer_increment"):
+        if hasattr(info, key):
+            val = _safe_float(getattr(info, key))
+            if key in ("ess", "effective_sample_size") and val is not None:
+                fields["ess"] = val
+            elif key == "log_normalizer_increment":
+                fields["log_normalizer_increment"] = val
+
+    update_info = getattr(info, "update_info", None)
+    if update_info is not None:
+        if isinstance(update_info, dict):
+            if "acceptance_rate" in update_info:
+                acc = np.asarray(update_info["acceptance_rate"], dtype=float)
+                if acc.size > 0:
+                    fields["mean_acceptance_rate"] = float(np.mean(acc))
+        else:
+            if hasattr(update_info, "acceptance_rate"):
+                acc = np.asarray(getattr(update_info, "acceptance_rate"), dtype=float)
+                if acc.size > 0:
+                    fields["mean_acceptance_rate"] = float(np.mean(acc))
+
+    return fields
+
+
 def run_tempered_smc(
     log_prior_fn: Callable,
     log_likelihood_fn: Callable,
@@ -218,9 +258,19 @@ def run_tempered_smc(
         if debug and (step_count % max(debug_stride, 1) == 0):
             scores = jax.vmap(log_prob_fn)(state.particles)
             n_bad = int(scores.shape[0] - jnp.sum(jnp.isfinite(scores)))
-            print(
+            fields = _extract_tempered_info_fields(info)
+            msg = (
                 f"  [debug] step={step_count:3d} lambda={float(state.tempering_param):.4f} "
                 f"non-finite logp particles: {n_bad}/{scores.shape[0]}"
+            )
+            if fields["mean_acceptance_rate"] is not None:
+                msg += f" | mean_accept={fields['mean_acceptance_rate']:.3f}"
+            if fields["ess"] is not None:
+                msg += f" | ess={fields['ess']:.2f}"
+            if fields["log_normalizer_increment"] is not None:
+                msg += f" | dlogZ={fields['log_normalizer_increment']:.4f}"
+            print(
+                msg
             )
     
     dt = time.time() - t0

@@ -1,6 +1,7 @@
 import os
 import sys
 import contextlib
+import time
 import numpy as np
 from pathlib import Path
 
@@ -35,6 +36,113 @@ from sampling.imp_blackjax_adapter import (
     assert_imp_roundtrip,
     write_flat_to_imp,
 )
+
+
+def get_runtime_environment_info():
+    """Collect backend/device info for timing reports."""
+    jax_devices = jax.devices()
+    jax_platforms = sorted({d.platform for d in jax_devices})
+    jax_device_names = [str(d) for d in jax_devices]
+    default_backend = jax.default_backend()
+    is_jax_cpu_only = bool(jax_platforms) and all(p == "cpu" for p in jax_platforms)
+
+    return {
+        "jax_default_backend": default_backend,
+        "jax_platforms": jax_platforms,
+        "jax_device_count": len(jax_devices),
+        "jax_device_names": jax_device_names,
+        "jax_cpu_only": is_jax_cpu_only,
+        # IMP sampling is C++ scoring path unless explicitly routed through _get_jax().
+        "imp_replica_exchange_uses_jax_score_path": False,
+    }
+
+
+def write_timing_report_txt(report_path, benchmark_config, env_info, timing_results):
+    """Write a detailed plain-text benchmarking report."""
+    report_path = Path(report_path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rmh = timing_results.get("rmh", {})
+    rex = timing_results.get("rex", {})
+
+    rmh_steps = int(rmh.get("n_steps", 0))
+    rex_frames = int(rex.get("number_of_frames", 0))
+    rmh_seconds = float(rmh.get("elapsed_seconds", float("nan")))
+    rex_seconds = float(rex.get("elapsed_seconds", float("nan")))
+
+    rmh_rate = (rmh_steps / rmh_seconds) if (rmh_steps > 0 and rmh_seconds > 0.0) else float("nan")
+    rex_rate = (rex_frames / rex_seconds) if (rex_frames > 0 and rex_seconds > 0.0) else float("nan")
+
+    lines = []
+    lines.append("IMP vs BlackJAX Sampling Timing Report")
+    lines.append("=" * 80)
+    lines.append(f"Generated at unix_time: {time.time():.6f}")
+    lines.append("")
+
+    lines.append("Benchmark configuration")
+    lines.append("-" * 80)
+    for k in sorted(benchmark_config.keys()):
+        lines.append(f"{k}: {benchmark_config[k]}")
+    lines.append("")
+
+    lines.append("Runtime environment")
+    lines.append("-" * 80)
+    lines.append(f"jax_default_backend: {env_info['jax_default_backend']}")
+    lines.append(f"jax_platforms: {env_info['jax_platforms']}")
+    lines.append(f"jax_device_count: {env_info['jax_device_count']}")
+    lines.append("jax_device_names:")
+    for name in env_info["jax_device_names"]:
+        lines.append(f"  - {name}")
+    lines.append(f"jax_cpu_only: {env_info['jax_cpu_only']}")
+    lines.append("")
+
+    lines.append("Sampler timing")
+    lines.append("-" * 80)
+    lines.append("BlackJAX RMH")
+    lines.append(f"  n_steps: {rmh_steps}")
+    lines.append(f"  elapsed_seconds: {rmh_seconds:.6f}")
+    lines.append(f"  steps_per_second: {rmh_rate:.6f}")
+    lines.append(f"  acceptance_rate: {rmh.get('acceptance_rate', 'n/a')}")
+    lines.append(f"  final_imp_score: {rmh.get('final_imp_score', 'n/a')}")
+    lines.append("")
+    lines.append("IMP ReplicaExchange")
+    lines.append(f"  number_of_frames: {rex_frames}")
+    lines.append(f"  monte_carlo_steps: {rex.get('monte_carlo_steps', 'n/a')}")
+    lines.append(f"  elapsed_seconds: {rex_seconds:.6f}")
+    lines.append(f"  frames_per_second: {rex_rate:.6f}")
+    lines.append(f"  final_imp_score: {rex.get('final_imp_score', 'n/a')}")
+    lines.append("")
+
+    lines.append("Score-path interpretation")
+    lines.append("-" * 80)
+    lines.append(
+        "BlackJAX RMH path: uses IMP->JAX score path via sf_imp._get_jax(), "
+        "adapter log_prob(), and JAX-jitted score wrappers."
+    )
+    lines.append(
+        "IMP ReplicaExchange path: uses IMP C++ scoring path inside PMI ReplicaExchange "
+        "(no sf_imp._get_jax() call in the REX loop)."
+    )
+    lines.append(
+        "Therefore REX in this script is not using the JAX-jitted scoring pipeline for sampling."
+    )
+    lines.append("")
+
+    lines.append("CPU/GPU interpretation")
+    lines.append("-" * 80)
+    if env_info["jax_cpu_only"]:
+        lines.append(
+            "JAX reports CPU-only devices in this run. BlackJAX RMH is running on CPU backend."
+        )
+    else:
+        lines.append(
+            "JAX reports non-CPU devices; BlackJAX RMH can run on accelerator backend for JAX kernels."
+        )
+    lines.append(
+        "IMP ReplicaExchange sampling uses IMP's native C++ path and is generally CPU-side in this workflow."
+    )
+
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 class TeeStream:
@@ -116,8 +224,98 @@ def get_rbs_and_beads(hiers):
     return rbs_ordered, beads
 
 
-def build_imp_system():
-    """Build your example string-of-beads system."""
+def _select_one_particle(root_hier, *, state_index, molecule, residue_index, copy_index=0):
+    """Return a single selected particle or raise with useful context."""
+    sel = IMP.atom.Selection(
+        root_hier,
+        state_index=int(state_index),
+        resolution=1,
+        molecule=str(molecule),
+        residue_index=int(residue_index),
+        copy_index=int(copy_index),
+    )
+    particles = sel.get_selected_particles()
+    if not particles:
+        raise ValueError(
+            "Selection failed for "
+            f"state={state_index}, molecule={molecule}, residue={residue_index}, copy_index={copy_index}."
+        )
+    return particles[0]
+
+
+def _add_inter_copy_assembly_restraints(
+    model,
+    root_hier,
+    n_copies,
+    residue_pairs,
+    mean_distance,
+    kappa,
+    left_molecule="KCOIL",
+    right_molecule="KCOIL",
+    close_ring=False,
+):
+    """
+    Add assembly restraints between adjacent copies/states.
+
+    Example default behavior:
+    state i: KCOIL[first/last]  <->  state i+1: KCOIL[first/last]
+    """
+    if int(n_copies) <= 1:
+        return []
+
+    pair_states = [(i, i + 1) for i in range(int(n_copies) - 1)]
+    if bool(close_ring) and int(n_copies) > 2:
+        pair_states.append((int(n_copies) - 1, 0))
+
+    restraints = []
+    for left_state, right_state in pair_states:
+        for left_residue, right_residue in residue_pairs:
+            ts = IMP.core.Harmonic(float(mean_distance), float(kappa))
+            p_left = _select_one_particle(
+                root_hier,
+                state_index=left_state,
+                molecule=left_molecule,
+                residue_index=int(left_residue),
+                copy_index=0,
+            )
+            p_right = _select_one_particle(
+                root_hier,
+                state_index=right_state,
+                molecule=right_molecule,
+                residue_index=int(right_residue),
+                copy_index=0,
+            )
+            dr = IMP.core.DistanceRestraint(model, ts, p_left, p_right)
+            restraints.append(dr)
+            print(
+                "Added inter-copy assembly restraint: "
+                f"state={left_state}:{left_molecule}[{left_residue}] "
+                f"<-> state={right_state}:{right_molecule}[{right_residue}]"
+            )
+    return restraints
+
+
+def build_imp_system(
+    copy_count=1,
+    inter_copy_residue_pairs=((1, 1), (52, 52)),
+    inter_mean_distance=15.0,
+    inter_kappa=5.0,
+    inter_left_molecule="KCOIL",
+    inter_right_molecule="KCOIL",
+    close_ring=False,
+):
+    """Build string-of-beads system with copy-count assembly restraints.
+
+    Restraints included:
+    1) Connectivity restraints (within each copy/state)
+    2) Harmonic inter-copy assembly restraints (between adjacent copies/states)
+
+    No other restraints are added here.
+    """
+    copy_count = int(copy_count)
+    if copy_count < 1:
+        raise ValueError(f"copy_count must be >= 1, got {copy_count}.")
+
     data_dir = os.path.join(os.getcwd(), "data")
     pdb_dir = os.path.join(data_dir, "pdb")
     fasta_dir = os.path.join(data_dir, "fasta")
@@ -139,7 +337,9 @@ def build_imp_system():
         )
 
     bs = IMP.pmi.macros.BuildSystem(m, name="ToyModel", resolutions=[1])
-    bs.add_state(topology)
+    for _ in range(copy_count):
+        # Each added state is a structural copy of the topology.
+        bs.add_state(topology)
     root_hier, dof = bs.execute_macro()
 
     out = IMP.pmi.output.Output()
@@ -154,58 +354,37 @@ def build_imp_system():
             leaves = IMP.core.get_leaves(mol)
             print(f"  {mol.get_name()} : {len(leaves)} bead(s)")
 
-    molecules = bs.get_molecules()[0]
+    state_molecules = bs.get_molecules()
     connectivity_wrappers = []
-    for mol_names in molecules:
-        for mol in molecules[mol_names]:
-            cr = IMP.pmi.restraints.stereochemistry.ConnectivityRestraint(mol)
-            cr.set_label(mol.get_name())
-            cr.add_to_model()
-            connectivity_wrappers.append(cr)
-            print(f"Added connectivity restraint for molecule: {mol.get_name()}")
+    for state_idx, molecules in enumerate(state_molecules):
+        for mol_names in molecules:
+            for mol in molecules[mol_names]:
+                cr = IMP.pmi.restraints.stereochemistry.ConnectivityRestraint(mol)
+                cr.set_label(f"{mol.get_name()}_state{state_idx}")
+                cr.add_to_model()
+                connectivity_wrappers.append(cr)
+                print(
+                    "Added connectivity restraint for molecule: "
+                    f"{mol.get_name()} (state={state_idx})"
+                )
 
-    # Add matched restraints for residue pairs: 1-1, 2-2, ..., 11-11.
-    distance_max = 10.0
-    kappa = 40.0
-    n_extra_restraints = 10
-    # adding distance restraints only between flexible beads and not the 
-    # rigid bodies
-    n_pairs = 1 + n_extra_restraints
     distance_restraints = []
-
-    for residue_index in range(1, n_pairs + 1):
-        ts = IMP.core.HarmonicUpperBound(distance_max, kappa)
-
-        sel1 = IMP.atom.Selection(
-            root_hier,
-            resolution=1,
-            molecule="KCOIL",
-            residue_index=residue_index,
-            copy_index=0,
-        )
-        sel2 = IMP.atom.Selection(
-            root_hier,
-            resolution=1,
-            molecule="ECOIL",
-            residue_index=residue_index,
-            copy_index=0,
-        )
-
-        particle_1 = sel1.get_selected_particles()
-        particle_2 = sel2.get_selected_particles()
-        if not particle_1 or not particle_2:
-            raise ValueError(
-                f"Could not find selection for residue pair {residue_index}-{residue_index}."
-            )
-
-        dr = IMP.core.DistanceRestraint(m, ts, particle_1[0], particle_2[0])
-        print(f"Added distance restraint for residue pair {residue_index}-{residue_index}.")
-        distance_restraints.append(dr)
-
-    print(f"Added {len(distance_restraints)} matched distance restraints (1-1 to {n_pairs}-{n_pairs}).")
-
-    # Need to add distance restraints that will act as connectivity restraints. 
-    # TODO: 
+    assembly_restraints = _add_inter_copy_assembly_restraints(
+        model=m,
+        root_hier=root_hier,
+        n_copies=copy_count,
+        residue_pairs=[(int(a), int(b)) for a, b in inter_copy_residue_pairs],
+        mean_distance=float(inter_mean_distance),
+        kappa=float(inter_kappa),
+        left_molecule=str(inter_left_molecule),
+        right_molecule=str(inter_right_molecule),
+        close_ring=bool(close_ring),
+    )
+    distance_restraints.extend(assembly_restraints)
+    print(
+        "Added inter-copy harmonic assembly restraints: "
+        f"{len(assembly_restraints)}"
+    )
 
     IMP.pmi.tools.shuffle_configuration(
         root_hier,
@@ -237,7 +416,7 @@ def build_imp_system():
     print(
         "Scoring function contains "
         f"{len(connectivity_restraints)} connectivity restraint(s) and "
-        f"{len(distance_restraints)} explicit distance restraint(s)."
+        f"{len(distance_restraints)} inter-copy harmonic restraint(s)."
     )
     print(f"Initial shuffled IMP score: {sf_imp.evaluate(False):.4f}")
 
@@ -410,6 +589,7 @@ def run_rmh_case(
     dof_mode,
     rmh_trajectory_rmf,
     rmh_final_rmf,
+    rmh_n_steps,
 ):
     """Run RMH sampling and write trajectory/final snapshots."""
     rmh_adapter, leaf_rows, n_jax_rows = build_smc_adapter_context(
@@ -453,11 +633,12 @@ def run_rmh_case(
         write_stride=10,
     )
 
+    t0 = time.perf_counter()
     result = run_rmh_on_imp_system(
         log_prob_fn=rmh_adapter.log_prob,
         initial_position=x0,
         rng_key=jax.random.PRNGKey(0),
-        n_steps=10000,
+        n_steps=int(rmh_n_steps),
         sigma=2.0,
         proposal_fn=proposal_fn,
         sync_fn=sync_fn,
@@ -465,6 +646,7 @@ def run_rmh_case(
         step_callback=step_callback,
         verbose=True,
     )
+    rmh_elapsed = time.perf_counter() - t0
 
     rmf_output.close_rmf(str(rmh_trajectory_rmf))
 
@@ -489,6 +671,14 @@ def run_rmh_case(
     out.init_rmf(str(rmh_final_rmf), [root_hier])
     out.write_rmf(str(rmh_final_rmf))
     out.close_rmf(str(rmh_final_rmf))
+
+    return {
+        "n_steps": int(rmh_n_steps),
+        "elapsed_seconds": float(rmh_elapsed),
+        "acceptance_rate": float(result.acceptance_rate),
+        "final_imp_score": float(final_score),
+        "best_log_posterior": float(np.max(result.log_probs)),
+    }
 
 
 def run_fixed_smc_case(
@@ -632,7 +822,15 @@ def run_adaptive_smc_case(
     out.close_rmf(str(adaptive_smc_final_rmf))
 
 
-def run_replica_exchange_case(m, root_hier, dof, sf_imp, rex_final_rmf):
+def run_replica_exchange_case(
+    m,
+    root_hier,
+    dof,
+    sf_imp,
+    rex_final_rmf,
+    rex_number_of_frames,
+    rex_monte_carlo_steps,
+):
     """Run IMP ReplicaExchange with flexible-only movers and save snapshot."""
     IMP.pmi.tools.shuffle_configuration(
         root_hier,
@@ -652,21 +850,46 @@ def run_replica_exchange_case(m, root_hier, dof, sf_imp, rex_final_rmf):
     rex = IMP.pmi.macros.ReplicaExchange(
         m,
         root_hier=root_hier,
-        monte_carlo_sample_objects=flexible_movers,
+        monte_carlo_sample_objects=all_movers,
         output_objects=[],
-        number_of_frames=500,
+        monte_carlo_steps=int(rex_monte_carlo_steps),
+        number_of_frames=int(rex_number_of_frames),
     )
+    t0 = time.perf_counter()
     rex.execute_macro()
+    rex_elapsed = time.perf_counter() - t0
 
     out = IMP.pmi.output.Output()
     out.init_rmf(str(rex_final_rmf), [root_hier])
     out.write_rmf(str(rex_final_rmf))
     out.close_rmf(str(rex_final_rmf))
-    print(f"Final IMP score after ReplicaExchange: {sf_imp.evaluate(False):.4f}")
+    final_score = float(sf_imp.evaluate(False))
+    print(f"Final IMP score after ReplicaExchange: {final_score:.4f}")
+
+    return {
+        "number_of_frames": int(rex_number_of_frames),
+        "monte_carlo_steps": int(rex_monte_carlo_steps),
+        "elapsed_seconds": float(rex_elapsed),
+        "final_imp_score": float(final_score),
+    }
 
 
 def main():
-    m, root_hier, dof, sf_imp, _ = build_imp_system()
+    copy_count = 2
+    # Example multi-copy setup:
+    # copy_count = 2
+
+    m, root_hier, dof, sf_imp, _ = build_imp_system(
+        copy_count=copy_count,
+        inter_copy_residue_pairs=((1, 1), (52, 52)),
+        inter_mean_distance=15.0,
+        inter_kappa=5.0,
+        inter_left_molecule="KCOIL",
+        inter_right_molecule="KCOIL",
+        close_ring=False,
+    )
+
+    print(f"Configured copy_count={copy_count}")
 
     rmh_output_dir = prepare_sampler_output_dir("rmh")
     smc_output_dir = prepare_sampler_output_dir("smc")
@@ -691,8 +914,30 @@ def main():
     smc_debug = True
     smc_debug_stride = 10
 
+    # Benchmark controls for direct RMH vs REX comparison.
+    rmh_n_steps = 1000
+    rex_number_of_frames = 1000
+    rex_monte_carlo_steps = 20
+
+    env_info = get_runtime_environment_info()
+    print("Runtime environment summary:")
+    print(f"  JAX default backend: {env_info['jax_default_backend']}")
+    print(f"  JAX platforms: {env_info['jax_platforms']}")
+    print(f"  JAX CPU-only: {env_info['jax_cpu_only']}")
+
+    benchmark_config = {
+        "copy_count": int(copy_count),
+        "dof_mode": smc_dof_mode,
+        "rmh_n_steps": int(rmh_n_steps),
+        "rex_number_of_frames": int(rex_number_of_frames),
+        "rex_monte_carlo_steps": int(rex_monte_carlo_steps),
+        "box_half_width": float(box_half_width),
+    }
+
+    timing_results = {}
+
     with tee_to_log(rmh_output_dir / "rmh_run.log"):
-        run_rmh_case(
+        timing_results["rmh"] = run_rmh_case(
             model=m,
             root_hier=root_hier,
             dof=dof,
@@ -701,42 +946,54 @@ def main():
             dof_mode=smc_dof_mode,
             rmh_trajectory_rmf=rmh_trajectory_rmf,
             rmh_final_rmf=rmh_final_rmf,
+            rmh_n_steps=rmh_n_steps,
         )
 
-    with tee_to_log(smc_output_dir / "smc_run.log"):
-        run_fixed_smc_case(
-            root_hier=root_hier,
-            dof=dof,
-            sf_imp=sf_imp,
-            box_half_width=box_half_width,
-            dof_mode=smc_dof_mode,
-            smc_debug=smc_debug,
-            smc_debug_stride=smc_debug_stride,
-            smc_best_trajectory_rmf=smc_best_trajectory_rmf,
-            smc_final_rmf=smc_final_rmf,
-        )
+#    with tee_to_log(smc_output_dir / "smc_run.log"):
+#        run_fixed_smc_case(
+#            root_hier=root_hier,
+#            dof=dof,
+#            sf_imp=sf_imp,
+#            box_half_width=box_half_width,
+#            dof_mode=smc_dof_mode,
+#            smc_debug=smc_debug,
+#            smc_debug_stride=smc_debug_stride,
+#            smc_best_trajectory_rmf=smc_best_trajectory_rmf,
+#            smc_final_rmf=smc_final_rmf,
+#        )
 
-    with tee_to_log(adaptive_smc_output_dir / "adaptive_smc_run.log"):
-        run_adaptive_smc_case(
-            root_hier=root_hier,
-            dof=dof,
-            sf_imp=sf_imp,
-            box_half_width=box_half_width,
-            dof_mode=smc_dof_mode,
-            smc_debug=smc_debug,
-            smc_debug_stride=smc_debug_stride,
-            adaptive_smc_best_trajectory_rmf=adaptive_smc_best_trajectory_rmf,
-            adaptive_smc_final_rmf=adaptive_smc_final_rmf,
-        )
+#    with tee_to_log(adaptive_smc_output_dir / "adaptive_smc_run.log"):
+#        run_adaptive_smc_case(
+#            root_hier=root_hier,
+#            dof=dof,
+#            sf_imp=sf_imp,
+#            box_half_width=box_half_width,
+#            dof_mode=smc_dof_mode,
+#            smc_debug=smc_debug,
+#            smc_debug_stride=smc_debug_stride,
+#            adaptive_smc_best_trajectory_rmf=adaptive_smc_best_trajectory_rmf,
+#            adaptive_smc_final_rmf=adaptive_smc_final_rmf,
+#        )
 
     with tee_to_log(rex_output_dir / "rex_run.log"):
-        run_replica_exchange_case(
+        timing_results["rex"] = run_replica_exchange_case(
             m=m,
             root_hier=root_hier,
             dof=dof,
             sf_imp=sf_imp,
             rex_final_rmf=rex_final_rmf,
+            rex_number_of_frames=rex_number_of_frames,
+            rex_monte_carlo_steps=rex_monte_carlo_steps,
         )
+
+    timing_report_path = Path.cwd() / "sampling_timing_report.txt"
+    write_timing_report_txt(
+        report_path=timing_report_path,
+        benchmark_config=benchmark_config,
+        env_info=env_info,
+        timing_results=timing_results,
+    )
+    print(f"Saved timing report: {timing_report_path}")
     
 
 if __name__ == "__main__":

@@ -1,0 +1,438 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{mathtools}
+\usepackage{microtype}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{The IMP\,/\,BlackJAX sampling pipeline:\\
+       representations, scoring, and where the rigid bodies go}
+\author{Sree Ganesh Balasubramani}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This note documents the string-of-beads IMP\,/\,BlackJAX pipeline in enough
+detail that the next person to touch it --- most likely me, six months from now
+--- does not have to re-derive its structure from the source. The emphasis is
+deliberately not on what each function returns. It is on \emph{where each
+representation of the system lives}, \emph{which of the two available scoring
+paths is actually being evaluated}, \emph{where compilation happens and how
+often}, and \emph{which degrees of freedom are genuinely being sampled as
+opposed to merely being present in the model}. The last of these has already
+cost me more debugging time than everything else combined, and it is treated at
+length.
+\end{abstract}
+
+\section{Scope and the short version}
+
+The entrypoint under discussion is
+\code{imp\_testing/string\_of\_beads/run\_imp\_flexible\_blackjax.py},
+together with the two modules it delegates to,
+\code{sampling/imp\_blackjax\_adapter.py} and
+\code{sampling/wrapper\_imp\_blackjax.py}.
+
+The architecture can be summarised in five statements, each of which is
+expanded on below.
+
+\begin{itemize}[leftmargin=1.5em]
+  \item IMP owns the physics. The topology, hierarchy, restraints, and the
+    definition of what counts as a rigid body are all constructed on the IMP
+    side and are never re-derived elsewhere.
+  \item An adapter layer converts that model into a flat vector of real numbers
+    together with a pure JAX function mapping that vector to a scalar energy.
+  \item BlackJAX never sees an IMP hierarchy. It is handed a flat vector and a
+    log-density callable, and it returns flat vectors. It is a sampler, not a
+    model.
+  \item The hot path is the JAX score evaluation, not the Python control loop
+    and not proposal generation.
+  \item Which variables are sampled is decided by a single configuration
+    string. Rigid bodies exist in the model and contribute to the energy
+    regardless, but they are only \emph{moved} when that string selects them.
+\end{itemize}
+
+\section{Three representations of the same system}
+
+Most of the confusion in this codebase comes from the fact that the same
+physical assembly is represented three times, in three incompatible formats,
+and that the conversions between them are where the bugs live.
+
+\paragraph{The IMP hierarchy.}
+This is the authoritative representation. It is built in
+\code{build\_imp\_system()} by \code{IMP.pmi.topology.TopologyReader}, which
+parses \code{data/topology.txt}, followed by
+\code{IMP.pmi.macros.BuildSystem}, which materialises the hierarchy and the
+degrees-of-freedom bookkeeping. Connectivity restraints are added per molecule
+via \code{IMP.pmi.restraints.stereochemistry.ConnectivityRestraint}, and
+explicit harmonic upper-bound restraints between matched residues of the two
+coils are added as raw \code{IMP.core.DistanceRestraint} objects. The result is
+a graph of states, molecules, fragments, and particles, decorated with
+\code{XYZR}, \code{RigidBody}, and \code{RigidMember} as appropriate, plus a
+list of restraints that is finally wrapped into an
+\code{IMP.core.RestraintsScoringFunction}.
+
+For the test system this yields four rigid bodies (residues 1--21 and 32--52 of
+each of KCOIL and ECOIL) and twenty flexible beads (residues 22--31 of each),
+for 104 hierarchy leaves out of 1904 model particles.
+
+\paragraph{The JAX model dictionary.}
+Calling \code{sf\_imp.\_get\_jax()} returns an interface object exposing
+\code{get\_jax\_model()} and \code{score\_func}. The model dictionary contains
+two arrays, \code{xyz} and \code{r}, which are exports of IMP's internal sphere
+table.
+
+This detail is worth stating precisely, because a great deal of unnecessary
+machinery was written before it was understood. \textbf{The sphere table is
+indexed by particle index.} Row $i$ of \code{jm['xyz']} corresponds to
+\code{ParticleIndex(i)}, for every $i$, with no exceptions and no permutation.
+Particles that carry no \code{XYZR} decorator --- hierarchy nodes, residues,
+chains, and so forth --- occupy their row as $(+\infty,+\infty,+\infty)$ with
+radius $+\infty$. In the test system 1560 of the 1904 rows are finite and 344
+are placeholders. Any code that reconstructs this mapping by matching
+coordinates is solving a problem that does not exist, and is moreover fragile:
+the placeholder rows participate in the nearest-neighbour search and two beads
+at coincident positions will be assigned arbitrarily.
+
+\paragraph{The flat DOF vector.}
+BlackJAX samples $\theta \in \mathbb{R}^{n}$ and nothing else. The mapping
+between $\theta$ and the sphere table is established by
+\code{IMPDOFSpace.from\_imp(...)} and consumed by \code{IMPSMCAdapter}. The
+layout is
+\[
+  \theta = \bigl[\underbrace{t_1, q_1, \ldots, t_{K}, q_{K}}_{\text{7 per rigid body}},\;
+                 \underbrace{x_1, y_1, z_1, \ldots}_{\text{3 per flexible bead}}\bigr],
+\]
+where $t_k \in \mathbb{R}^3$ is a rigid-body translation and $q_k \in
+\mathbb{R}^4$ is a quaternion stored scalar-first as $[w,x,y,z]$.
+
+Every sphere-table row that is not written by this decoding is frozen at
+whatever value it held when the DOF space was constructed. That is the
+mechanism by which a mode selection silences part of the system, and it is
+silent by design.
+
+\section{Rigid bodies: what IMP hands over, and what must be handed back}
+
+\subsection{The extraction side}
+
+\code{IMP.core.\_jax\_rigid.\_get\_rigid\_bodies(model)} returns everything
+needed to parameterise the rigid degrees of freedom, and it should be used in
+preference to reconstructing any of it:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \code{intcoord}, a particle-indexed array of \emph{body-frame}
+    coordinates;
+  \item \code{quaternion}, one $[w,x,y,z]$ per rigid body, indexed by
+    \code{rb\_index};
+  \item \code{rb\_index\_from\_particle}, mapping the rigid-body \emph{particle}
+    index to \code{rb\_index};
+  \item \code{bodies}, a list carrying \code{particle\_index},
+    \code{member\_particle\_indexes}, and \code{body\_member\_indexes} for
+    nested bodies;
+  \item \code{non\_rigid\_members}, empty in the present system.
+\end{itemize}
+
+The relation that ties these together, and which has been verified numerically
+against IMP's own expansion to within the precision of the printed output, is
+\begin{equation}
+  \label{eq:expand}
+  \mathrm{xyz}[p] \;=\; R\bigl(q_{\,b(p)}\bigr)\,\mathrm{intcoord}[p]
+                    \;+\; \mathrm{xyz}\bigl[\pi(b(p))\bigr],
+\end{equation}
+where $b(p)$ is the rigid body containing member $p$, $\pi(b)$ is that body's
+own particle index, and $R(\cdot)$ is the standard rotation matrix of a unit
+quaternion. Two consequences follow.
+
+First, the rigid-body translation is not stored separately: it \emph{is} the
+sphere-table row of the rigid-body particle. In the test system rows
+$1900$--$1903$ hold the four reference-frame origins. Any decoder that rewrites
+member rows but leaves those four rows stale produces an internally
+inconsistent model.
+
+Second, \code{intcoord} is the body-frame coordinate, not a world-frame offset
+from the centre. Computing $\mathrm{xyz}[p] - \mathrm{com}$ instead and then
+applying $R(q)$ to it applies the initial rotation twice, so that
+$\mathrm{decode}(\mathrm{encode}(\cdot))$ is not the identity. The
+parameterisation remains a valid chart on $SE(3)$ --- the reachable set is
+unchanged --- but the encoded state no longer corresponds to the actual IMP
+configuration, which quietly invalidates warm starts and any comparison between
+the JAX and C++ scores.
+
+\subsection{The write-back side, and why trajectories appear frozen}
+
+Sampling produces flat vectors. Writing them back into IMP is required for RMF
+output and for any subsequent IMP-side analysis, and it is the step where the
+most time has been lost.
+
+\textbf{Rigid-body members must be written through the reference frame.} The
+global coordinate of a \code{RigidMember} is a derived quantity. IMP maintains a
+\code{ScoreState} that recomputes it from the body's reference frame on the next
+\code{model.update()}, and both \code{RMF} frame saving and
+\code{ScoringFunction.evaluate()} trigger that update. Consequently the
+apparently obvious
+\begin{center}
+\code{IMP.core.XYZ(member).set\_coordinates(...)}
+\end{center}
+is a no-op for anything belonging to a rigid body: the assignment is made and
+then immediately reverted. The correct operation is
+\begin{center}
+\code{IMP.core.RigidBody(model, pi).set\_reference\_frame(} \\
+\code{IMP.algebra.ReferenceFrame3D(} \\
+\code{IMP.algebra.Transformation3D(Rotation3D(w,x,y,z), Vector3D(t))))}
+\end{center}
+followed by \code{model.update()}. Flexible beads are free particles and may be
+written directly.
+
+The failure mode this produces is maximally confusing: the sampler runs, the
+score changes, the acceptance rate looks reasonable, and the trajectory is
+static. Because the same writer is used for flexible beads, where it works
+correctly, the symptom appears only when rigid-body sampling is switched on,
+which naturally directs suspicion at the rigid-body code rather than at the
+output path.
+
+\subsection{Non-rigid members}
+
+The present topology declares none, and the extraction path asserts as much.
+This is a placeholder rather than a limitation of principle. When a non-rigid
+selection is added, those particles acquire three sampled degrees of freedom
+each \emph{in the body frame}, and appear in \code{non\_rigid\_members} rather
+than as free beads. Treating them as flexible beads and writing world
+coordinates would be wrong in a way that no current test would catch, so the
+assertion should stay until the case is handled explicitly.
+
+\section{The two scoring paths}
+
+The pipeline contains two distinct implementations of the energy, and it is
+essential to know which one is being evaluated.
+
+\paragraph{The C++ path.}
+\code{IMPLogPosterior} in \code{wrapper\_imp\_blackjax.py} unpacks the flat
+vector into the IMP model, calls \code{sf\_imp.evaluate(False)}, and returns the
+scalar. This routes through IMP's C++ scoring machinery. It is exact and it is
+the reference, but it is impure --- it mutates global IMP state --- and it can
+be neither JIT-compiled nor vectorised. Every evaluation is a Python-to-C++
+round trip.
+
+\paragraph{The JAX path.}
+\code{IMPSMCAdapter} decodes the flat vector to a full \code{xyz} array with
+\code{\_flat\_to\_xyz}, substitutes it into a frozen copy of the base model
+dictionary, and calls \code{ji.score\_func(jm)}. This is pure, compilable, and
+vectorisable over particles, which is what makes SMC tractable.
+
+Agreement between the two has been confirmed directly: for the unshuffled test
+system both report $64727.965$. Note, though, that the JAX value is
+$64727.965$ against the C++ value $64727.96513564067$. That is single precision,
+and at an energy of $6.5\times 10^4$ the absolute resolution of
+\code{float32} is roughly $4\times10^{-3}$ --- larger than many of the score
+differences a Metropolis ratio is required to resolve. Enabling
+\code{jax\_enable\_x64} before the first JAX array is created is therefore not
+an optimisation but a correctness requirement.
+
+The log-likelihood exposed to BlackJAX is
+\begin{equation}
+  \log L(\theta) \;=\; -\,\frac{E(\theta)}{k_{\mathrm{B}}T},
+\end{equation}
+with $E$ the IMP energy. The sign convention matters: IMP minimises, BlackJAX
+maximises.
+
+\paragraph{A methodological caution.}
+Because RMH was originally wired to the C++ path and SMC to the JAX path, any
+comparison between them confounded the sampler with the score implementation
+and, in the original wiring, with the choice of degrees of freedom as well. For
+a defensible comparison all samplers must consume the same
+\code{adapter.log\_prob} over the same DOF space, differing only in the sampling
+algorithm. The C++ path is best retained as a test oracle rather than as a
+production route.
+
+\section{Compilation: where it happens, and how often}
+
+\paragraph{Adapter level.}
+\code{IMPSMCAdapter.\_build\_jax\_fns()} compiles five functions once at
+construction: \code{\_flat\_to\_xyz}, \code{\_score}, \code{log\_likelihood},
+\code{log\_prior}, and \code{log\_prob}. This is the intended behaviour and the
+cost is amortised immediately.
+
+It is worth noting that constructing an adapter is therefore not free. A
+parameterised test suite that builds one adapter per test compiles dozens of
+executables whose device binaries accumulate; on a GPU this eventually surfaces
+as \code{RESOURCE\_EXHAUSTED: Failed to load in-memory CUBIN (compiled for a
+different GPU?)}, which is CUDA's generic wording for an out-of-memory
+condition while loading a module and has nothing to do with architecture
+mismatch. Small diagnostic work belongs on the CPU backend.
+
+\paragraph{Sampler level.}
+In \code{smc\_base\_sampler.py} the mutation function and the weight function
+are decorated with \code{jax.jit} \emph{inside} the loop over temperature steps.
+Each iteration closes over a fresh tempered log-density carrying a new
+$\lambda$, so JAX sees a new function object and recompiles. With a hundred
+temperature steps and fifty MCMC sweeps per step, that is a hundred separate
+compilations of a scan over fifty kernel applications. Lifting these out of the
+loop and passing $\lambda$ and $\Delta\lambda$ as traced arguments is the single
+largest available speed-up.
+
+\paragraph{Implication.}
+The Python loop is not compiled and need not be. It orchestrates the algorithm;
+the per-particle work runs inside compiled code. Profiling attention belongs on
+the score evaluation and on compilation count, not on loop overhead.
+
+\section{What BlackJAX actually does}
+
+BlackJAX supplies sampler mechanics and no physics.
+
+\paragraph{Random-walk Metropolis--Hastings.}
+Given an initial position, a log-density, and a proposal rule, each step
+generates a proposal, evaluates the log-density there, forms the Metropolis
+ratio, and returns either the proposed or the current state. Because JAX arrays
+are immutable, the returned state is a new value rather than a mutation; the
+outer loop stores it. Running the whole chain under \code{jax.lax.scan} compiles
+it once instead of once per step, and removes the Python round trip entirely
+provided the log-density is pure.
+
+\paragraph{Sequential Monte Carlo.}
+At each tempering step the particle weights are updated by the incremental
+log-weight
+\begin{equation}
+  \Delta w_t(\theta) \;=\; (\lambda_t - \lambda_{t-1})\,\log L(\theta),
+\end{equation}
+particles are resampled according to the normalised weights, and each survivor
+is mutated by repeated applications of an MCMC kernel targeting
+$\pi_t \propto \pi_0 \, L^{\lambda_t}$. The fixed-schedule implementation
+computes the increments explicitly and calls \code{blackjax.smc.base.step};
+the adaptive variant lets BlackJAX choose $\lambda_t$ to hit a target effective
+sample size.
+
+\paragraph{A scaling caveat.}
+The validity of this construction assumes the initial population is distributed
+according to the prior. It presently is not: \code{sample\_prior} draws a
+Gaussian cloud around the current configuration while \code{log\_prior} is a
+flat box. More seriously, the energy scale matters enormously. After shuffling,
+the test system reports an energy of $1.5\times10^6$; with $k_{\mathrm{B}}T=1$
+the first geometric step ($\Delta\lambda \approx 10^{-4}$) spreads the
+log-weights across particles by two to three orders of magnitude, and systematic
+resampling collapses the population onto a single ancestor immediately. The
+best-particle-per-step trajectory then looks nearly static \emph{even when the
+degrees of freedom and the write-back are entirely correct}. Distinguishing this
+from a plumbing failure requires monitoring the effective sample size and the
+spread of the particle cloud, not just the trajectory.
+
+\section{Proposals}
+
+The RMH driver prefers an adapter-supplied proposal when one exists, falling
+back to an isotropic Gaussian of width \code{rmh\_sigma} otherwise. The
+adapter's \code{make\_rmh\_proposal\_fn} exposes three independent scales:
+$\sigma_{\mathrm{rb,trans}}$, $\sigma_{\mathrm{rb,rot}}$, and
+$\sigma_{\mathrm{fb}}$.
+
+Two points deserve emphasis.
+
+\paragraph{The generic \code{rmh\_sigma} may be inert.}
+When a block-structured proposal is supplied it takes precedence, and the
+effective step sizes come from \code{suggested\_rmh\_proposal()}. Passing
+\code{rmh\_sigma=2.0} and then reasoning about a two-\AA{} step is a reliable
+route to confusion.
+
+\paragraph{The rotation proposal must be multiplicative.}
+Orientations are updated by left-multiplication with a small rotation,
+$q' = \delta q \otimes q$ with $\delta q = \exp(\mathbf{v}/2)$ and $\mathbf{v}$
+Gaussian. This proposal is symmetric with respect to the Haar measure on
+$SO(3)$, so the plain Metropolis ratio is correct and no Jacobian correction is
+required. The fallback isotropic Gaussian on the raw four-vector is a
+\emph{different} measure. Since the decoder normalises the quaternion, the
+target is invariant to its norm, so the norm performs an unconstrained random
+walk; as it grows, a fixed-width additive step corresponds to an ever-smaller
+rotation, and the bodies gradually stop turning. Silently falling back to that
+proposal is therefore worse than failing loudly, and the exception handler that
+used to do so has been removed.
+
+A related point concerns initialisation. Drawing orientations as the encoded
+quaternion perturbed by a jitter of $0.1$ radians leaves every particle at
+essentially the same orientation, which reproduces the appearance of frozen
+rigid bodies from a completely different cause. A genuinely uniform draw ---
+a normalised isotropic four-dimensional Gaussian, which is uniform on $S^3$ and
+hence on $SO(3)$ up to the $\pm q$ double cover --- is what the tempered-SMC
+prior claims to be and is the correct default.
+
+\section{Which variables are sampled}
+
+This is controlled by the mode string passed to \code{IMPDOFSpace.from\_imp}:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Mode & Rigid bodies & Flexible beads \\
+\midrule
+\code{flex}  & frozen at template & sampled \\
+\code{rigid} & sampled            & frozen at template \\
+\code{all}   & sampled            & sampled \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Under \code{flex} the rigid-body descriptors are not even constructed:
+\code{rb\_descriptors} is empty and $n$ counts only bead coordinates. The bodies
+still contribute to the energy, since their frozen coordinates are carried
+through from the base model, but no sampler can move them. This is correct
+behaviour and it is also, on its own, a complete explanation for a run in which
+nothing rotates. It should be the first thing checked, and the DOF summary
+printed at adapter construction should state the rigid-body count explicitly so
+that it cannot be overlooked.
+
+\section{Output}
+
+RMF frames are written in two places: during RMH via a step callback, and after
+SMC by decoding the best particle from each temperature step. In both cases the
+flat state must be pushed through the reference-frame write-back described in
+Section~3.2 before the frame is saved. Decoding to \code{xyz} and assigning leaf
+coordinates directly is an export path that works for beads and silently fails
+for rigid bodies.
+
+\section{Invariants worth testing}
+
+The following are cheap, local, and each fails for exactly one reason, which is
+what makes them useful.
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item $\log p(\theta) = \log \pi_0(\theta) + \log L(\theta)$ identically.
+  \item $\mathrm{decode}(\mathrm{encode}())$ reproduces the sphere table exactly
+    on all finite rows. This catches any body-frame inconsistency.
+  \item The JAX and C++ scores agree to double precision at the encoded state.
+  \item All pairwise distances within each rigid body are invariant under an
+    arbitrary $(t,q)$. This is the defining property of the parameterisation.
+  \item Perturbing a rigid body's degrees of freedom displaces its members by a
+    non-negligible amount. Guards directly against the frozen-trajectory
+    symptom.
+  \item Writing a moved state into IMP and calling \code{model.update()}
+    reproduces the decoded geometry. This is the decisive round trip.
+  \item Assigning member \code{XYZ} directly is reverted by the
+    \code{ScoreState}. Worth asserting explicitly so the diagnosis in
+    Section~3.2 is recorded in executable form rather than in a comment.
+  \item In each mode, exactly the intended sphere-table rows change and the
+    remainder are frozen.
+  \item A block-structured proposal perturbs only its own block, and quaternion
+    norms remain unity.
+  \item The prior spreads orientations rather than concentrating on the starting
+    pose.
+  \item The effective sample size does not collapse over a short SMC run.
+\end{enumerate}
+
+\section{Summary}
+
+The pipeline joins three layers. IMP defines the physics and owns the
+authoritative representation. The adapter converts that representation into a
+flat latent vector and a pure, compilable score, and --- equally importantly ---
+converts sampled vectors back into IMP through the reference frame. BlackJAX
+performs RMH or SMC on the latent vector and knows nothing about proteins.
+
+Nearly all of the difficulty encountered so far has lived at the two boundaries
+rather than inside any of the three layers: the particle-index mapping on the
+way in, and the rigid-body write-back on the way out. Both are now pinned by
+explicit invariants, and both should stay pinned.
+
+\end{document}

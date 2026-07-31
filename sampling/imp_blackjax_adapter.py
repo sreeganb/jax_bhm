@@ -593,9 +593,19 @@ def assert_imp_roundtrip(
     ji,
     adapter: "IMPSMCAdapter",
     flat: Optional[np.ndarray] = None,
-    atol: float = 1e-8,
+    atol: Optional[float] = None,
+    warn_only: bool = False,
 ) -> float:
-    """Assert IMP and adapter xyz expansions match after writing a flat state."""
+    """Check IMP and adapter xyz expansions after writing a flat state.
+
+    Parameters
+    ----------
+    atol:
+        Absolute tolerance for coordinate comparison. If None, chooses a
+        backend-aware default: 1e-8 when JAX x64 is enabled, else 1e-2.
+    warn_only:
+        If True, emit a warning instead of raising AssertionError.
+    """
     state = np.asarray(adapter.encode() if flat is None else flat, dtype=np.float64)
     write_flat_to_imp(model, adapter.dof_space, state)
 
@@ -603,12 +613,20 @@ def assert_imp_roundtrip(
     jax_xyz = np.asarray(adapter.decode_xyz(jnp.asarray(state)), dtype=np.float64)
     finite = np.isfinite(imp_xyz).all(axis=1)
 
+    if atol is None:
+        atol = 1e-8 if bool(jax.config.jax_enable_x64) else 1e-2
+    atol = float(atol)
+
     if not np.allclose(imp_xyz[finite], jax_xyz[finite], atol=atol):
         max_abs_err = float(np.max(np.abs(imp_xyz[finite] - jax_xyz[finite])))
-        raise AssertionError(
+        msg = (
             "IMP/JAX rigid-body roundtrip mismatch: "
             f"max_abs_err={max_abs_err:.3e}, atol={atol:.1e}"
         )
+        if warn_only:
+            print(f"[roundtrip warning] {msg}")
+        else:
+            raise AssertionError(msg)
 
     return float(np.max(np.abs(imp_xyz[finite] - jax_xyz[finite])))
 

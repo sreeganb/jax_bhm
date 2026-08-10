@@ -502,8 +502,13 @@ def build_leaf_rows_from_coordinates(root_hier, jm_initial_xyz, atol=1e-3):
 
 
 def write_best_positions_to_rmf(root_hier, smc_adapter, best_positions, rmf_path, leaf_rows, n_jax_rows):
-    """Write SMC best-per-step trajectory by mapping decoded rows to hierarchy leaves."""
-    leaves = IMP.atom.get_leaves(root_hier)
+    """Write SMC best-per-step trajectory by syncing flat states back into IMP.
+
+    This uses the same flat-state write path as RMH: rigid-body reference
+    frames are updated through ``write_flat_to_imp`` before each RMF frame is
+    saved. That keeps the stored trajectory consistent with how the sampler
+    actually moved the rigid bodies.
+    """
 
     out = IMP.pmi.output.Output()
     out.init_rmf(rmf_path, [root_hier])
@@ -514,19 +519,7 @@ def write_best_positions_to_rmf(root_hier, smc_adapter, best_positions, rmf_path
         if not np.all(np.isfinite(np.asarray(pos))):
             continue
 
-        xyz = smc_adapter.decode_xyz(jnp.asarray(pos))
-        if xyz.shape[0] != n_jax_rows:
-            raise ValueError(
-                f"SMC decode size mismatch: decoded {xyz.shape[0]} rows, "
-                f"but JAX mapping has {n_jax_rows} rows."
-            )
-
-        leaf_xyz = xyz[leaf_rows]
-
-        for particle, coord in zip(leaves, leaf_xyz):
-            IMP.core.XYZ(particle).set_coordinates(
-                IMP.algebra.Vector3D(float(coord[0]), float(coord[1]), float(coord[2]))
-            )
+        write_flat_to_imp(root_hier.get_model(), smc_adapter.dof_space, np.asarray(pos, dtype=np.float64))
         out.write_rmf(rmf_path)
         n_written += 1
 

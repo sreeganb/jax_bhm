@@ -125,12 +125,12 @@ def main():
     parser.add_argument("--copies", type=int, default=N_COPIES,
                         help="number of copies of the molecule set")
     parser.add_argument("--samplers", nargs="+",
-                        default=["rmh", "replica_exchange"],
+                        default=["rmh", "smc", "replica_exchange"],
                         help="samplers to run, in order: "
                              "replica_exchange rmh smc adaptive_smc")
     parser.add_argument("--dof-mode", default=DOF_MODE,
                         choices=["flex", "rigid", "all"])
-    parser.add_argument("--rmh-steps", type=int, default=500000)
+    parser.add_argument("--rmh-steps", type=int, default=50000)
     parser.add_argument("--frames", type=int, default=1000,
                         help="ReplicaExchange frames")
     parser.add_argument("--mc-steps", type=int, default=10,

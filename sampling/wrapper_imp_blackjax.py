@@ -357,6 +357,7 @@ def run_smc_on_imp_system(
     kernel: str = "rmh",
     rmh_sigma: Optional[ArrayLike] = None,
     rmh_proposal_fn: Optional[Callable[[jax.Array, jnp.ndarray], jnp.ndarray]] = None,
+    initial_translation_sigma: Optional[float] = None,
     hmc_step_size: float = 0.05,
     hmc_num_integration_steps: int = 5,
     n_mcmc_steps: int = 10,
@@ -384,10 +385,17 @@ def run_smc_on_imp_system(
 
     # Draw an initial particle population from the adapter's prior.
     key_init, key_smc = jax.random.split(rng_key)
+    init_translation_sigma = (
+        float(initial_translation_sigma)
+        if initial_translation_sigma is not None
+        else float(adapter.suggested_initial_translation_sigma())
+        if hasattr(adapter, "suggested_initial_translation_sigma")
+        else 40.0
+    )
     initial_positions = adapter.sample_prior(
         n_particles=n_particles,
         rng_key=key_init,
-        translation_sigma=150.0,
+        translation_sigma=init_translation_sigma,
     )
 
     if verbose:
@@ -455,6 +463,7 @@ def run_adaptive_smc_on_imp_system(
     score_batch_size: Optional[int] = None,
     rmh_sigma: Optional[ArrayLike] = None,
     rmh_proposal_fn: Optional[Callable[[jax.Array, jnp.ndarray], jnp.ndarray]] = None,
+    initial_translation_sigma: Optional[float] = None,
     target_ess: float = 0.5,
     save_rmf3_path: Optional[str] = None,
     verbose: bool = True,
@@ -473,10 +482,17 @@ def run_adaptive_smc_on_imp_system(
         print(adapter.dof_summary())
 
     key_init, key_smc = jax.random.split(rng_key)
+    init_translation_sigma = (
+        float(initial_translation_sigma)
+        if initial_translation_sigma is not None
+        else float(adapter.suggested_initial_translation_sigma())
+        if hasattr(adapter, "suggested_initial_translation_sigma")
+        else 40.0
+    )
     initial_positions = adapter.sample_prior(
         n_particles=n_particles,
         rng_key=key_init,
-        translation_sigma=150.0,
+        translation_sigma=init_translation_sigma,
     )
 
     sigma = rmh_sigma if rmh_sigma is not None else adapter.suggested_rmh_sigma()

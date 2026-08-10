@@ -867,19 +867,29 @@ class IMPSMCAdapter:
 
         return positions
 
+    def suggested_initial_translation_sigma(self) -> float:
+        """Default spread for initial particles used by SMC."""
+        return 40.0
+
     def suggested_rmh_proposal(self) -> Dict[str, float]:
-        """Default proposal scales for mixed rigid-body/flexible-bead systems."""
+        """Default proposal scales for mixed rigid-body/flexible-bead systems.
+        
+        These are used by both RMH (long chains, can tolerate lower acceptance)
+        and SMC (short MCMC per temperature, needs larger moves to explore).
+        Values chosen to allow reasonable exploration in SMC's 10 steps/temperature
+        while maintaining usable acceptance in RMH's longer chains.
+        """
         return {
             "sigma_rb_trans": 1.5,
-            "sigma_rb_rot": 0.08,
-            "sigma_fb": 0.8,
+            "sigma_rb_rot": 0.5,
+            "sigma_fb": 2.0,
         }
 
     def make_rmh_proposal_fn(
         self,
-        sigma_rb_trans: float = 1.5,
-        sigma_rb_rot: float = 0.08,
-        sigma_fb: float = 0.8,
+        sigma_rb_trans: float = 3.5,
+        sigma_rb_rot: float = 1.0,
+        sigma_fb: float = 5.0,
         canonicalize_quat_sign: bool = True,
     ):
         """Build an RMH proposal over mixed Euclidean + SO(3) blocks."""
@@ -922,8 +932,8 @@ class IMPSMCAdapter:
 
     def suggested_rmh_sigma(self) -> float:
         """
-        A heuristic RMH step size: ~2 Å for coarse proteins.
-        Rotate by ~0.05 rad per step.
+        A heuristic RMH step size for isotropic proposals: ~5 Å for coarse proteins.
+        Used only if adapter proposal is not provided.
         """
         return 5.0
 

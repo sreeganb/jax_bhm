@@ -311,13 +311,12 @@ def write_positions_rmf(built, context, positions, rmf_path, skip_nonfinite=True
     """
     Write a trajectory from a sequence of flat sampled vectors.
 
-    Decodes each vector to xyz, reorders rows into hierarchy-leaf order via
-    context.leaf_rows, and writes one RMF frame per position. Non-finite states
-    (which SMC can produce late in tempering) are skipped rather than written as
-    NaNs that break every downstream analysis.
+    Each flat vector is written through the same IMP reference-frame sync path
+    used by RMH, so rigid-body translations and rotations are preserved in the
+    saved RMF. Non-finite states (which SMC can produce late in tempering) are
+    skipped rather than written as NaNs that break downstream analysis.
     """
     rmf_path = str(rmf_path)
-    leaves = IMP.atom.get_leaves(built.root_hier)
 
     output = IMP.pmi.output.Output()
     output.init_rmf(rmf_path, [built.root_hier])
@@ -328,17 +327,7 @@ def write_positions_rmf(built, context, positions, rmf_path, skip_nonfinite=True
         if skip_nonfinite and not np.all(np.isfinite(position)):
             continue
 
-        xyz = np.asarray(context.adapter.decode_xyz(jnp.asarray(position)))
-        if xyz.shape[0] != context.n_jax_rows:
-            raise ValueError(
-                f"Decoded {xyz.shape[0]} rows but the leaf mapping expects "
-                f"{context.n_jax_rows}."
-            )
-
-        for particle, coord in zip(leaves, xyz[context.leaf_rows]):
-            IMP.core.XYZ(particle).set_coordinates(
-                IMP.algebra.Vector3D(float(coord[0]), float(coord[1]), float(coord[2]))
-            )
+        apply_flat_position(built, context, position)
         output.write_rmf(rmf_path)
         n_written += 1
 
